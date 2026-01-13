@@ -1,0 +1,4 @@
+defaultNamespace: elmis-kafka-sender
+helm:
+  releaseName: elmis-kafka-sender
+  chart: ./elmis-kafka-sender-chart

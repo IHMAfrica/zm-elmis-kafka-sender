@@ -1,0 +1,53 @@
+spring:
+  application:
+    name: elmis-kafka-sender
+  r2dbc:
+    url: r2dbc:mssql://${DB_HOST}:${DB_PORT}/${DB_NAME}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    pool:
+      initial-size: 5
+      max-size: 20
+      max-idle-time: 30m
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
+    jaas-config: ${KAFKA_JAAS_CONFIG}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: 1
+      retries: 3
+      properties:
+        linger.ms: 50
+        batch.size: 32768
+        buffer.memory: 33554432
+        max.block.ms: 60000
+        request.timeout.ms: 30000
+        delivery.timeout.ms: 120000
+        compression.type: lz4
+        enable.idempotence: false
+
+elmis:
+  polling:
+    interval-ms: 500
+    idle-interval-ms: 2000
+    batch-size: 100
+  topics:
+    prescriptions: prescriptions
+    patient-profiles: patient-profiles
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.carepro: DEBUG
+    org.springframework.kafka: INFO
+    io.r2dbc.mssql: INFO
