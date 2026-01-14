@@ -21,7 +21,7 @@ public class ElmisLogRepository {
 
     public Flux<ElmisLogRecord> findUnprocessedRecords(int batchSize) {
         String query = """
-            SELECT TOP :batchSize
+            SELECT TOP (:batchSize)
                 Oid, HmisCode, PatientUuid, ArtNumber, Cd4Count, ViralLoad,
                 DateOfBled, RegimenId, DrugIdentifier, MedicationId, QuantityPerDose,
                 DosageUnit, Frequency, Duration, Height, HeightDateTimeCollected,
