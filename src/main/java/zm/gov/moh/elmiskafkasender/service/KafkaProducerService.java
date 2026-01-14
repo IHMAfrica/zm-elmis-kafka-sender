@@ -51,7 +51,6 @@ public class KafkaProducerService {
 
         return kafkaSender.send(Mono.just(senderRecord))
                 .next()
-                .timeout(Duration.ofSeconds(30))
                 .doOnSuccess(result -> {
                     assert result != null;
                     if (result.exception() != null) {
