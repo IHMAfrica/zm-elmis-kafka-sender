@@ -89,7 +89,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: elmis-kafka-sender-credentials
-                  key: PAITENT_PROFILES_TOPIC
+                  key: PATIENT_PROFILES_TOPIC
           {{- with .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
