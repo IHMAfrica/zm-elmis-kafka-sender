@@ -30,16 +30,8 @@ public class KafkaConfig {
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
 
-        props.put(ProducerConfig.ACKS_CONFIG, "1");
-        props.put(ProducerConfig.RETRIES_CONFIG, 3);
-        props.put(ProducerConfig.LINGER_MS_CONFIG, 50);
-        props.put(ProducerConfig.BATCH_SIZE_CONFIG, 32768);
-        props.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 33554432);
-        props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 60000);
-        props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 30000);
-        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120000);
-        props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "lz4");
-        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, false);
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.RETRIES_CONFIG, 10);
         props.put(ProducerConfig.SECURITY_PROVIDERS_CONFIG, jaasConfig);
 
         props.put(ProducerConfig.RETRY_BACKOFF_MS_CONFIG, 200);
