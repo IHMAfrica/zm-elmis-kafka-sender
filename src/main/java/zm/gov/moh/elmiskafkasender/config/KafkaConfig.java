@@ -33,6 +33,7 @@ public class KafkaConfig {
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.RETRIES_CONFIG, 10);
         props.put(ProducerConfig.SECURITY_PROVIDERS_CONFIG, jaasConfig);
+        props.put("sasl.jaas.config", jaasConfig);
 
         props.put(ProducerConfig.RETRY_BACKOFF_MS_CONFIG, 200);
 
