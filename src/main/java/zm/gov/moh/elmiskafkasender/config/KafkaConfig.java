@@ -34,7 +34,6 @@ public class KafkaConfig {
         props.put(ProducerConfig.LINGER_MS_CONFIG, 0);
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE); // Let delivery.timeout handle it
-        props.put(ProducerConfig.SECURITY_PROVIDERS_CONFIG, jaasConfig);
         props.put("sasl.jaas.config", jaasConfig);
         props.put("security.protocol", "SASL_PLAINTEXT");
         props.put("sasl.mechanism", "SCRAM-SHA-256");
