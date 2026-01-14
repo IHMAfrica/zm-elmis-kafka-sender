@@ -63,7 +63,7 @@ public class KafkaProducerService {
                                 correlationId);
                     }
                 })
-                .doOnError(e -> log.error("Error sending message [{}]: {}", correlationId, e.getMessage()));
+                .doOnError(e -> log.error("Error sending message [{}]: ", correlationId, e));
     }
 
     public void close() {
