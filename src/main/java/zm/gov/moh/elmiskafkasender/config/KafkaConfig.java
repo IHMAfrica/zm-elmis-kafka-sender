@@ -34,6 +34,8 @@ public class KafkaConfig {
         props.put(ProducerConfig.RETRIES_CONFIG, 10);
         props.put(ProducerConfig.SECURITY_PROVIDERS_CONFIG, jaasConfig);
         props.put("sasl.jaas.config", jaasConfig);
+        props.put("security.protocol", "SASL_PLAINTEXT");
+        props.put("sasl.mechanism", "SCRAM-SHA-256");
 
         props.put(ProducerConfig.RETRY_BACKOFF_MS_CONFIG, 200);
 
