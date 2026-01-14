@@ -80,6 +80,16 @@ spec:
                 secretKeyRef:
                   name: elmis-kafka-sender-credentials
                   key: KAFKA_JAAS_CONFIG
+            - name: PRESCRIPTIONS_TOPIC
+              valueFrom:
+                secretKeyRef:
+                  name: elmis-kafka-sender-credentials
+                  key: PRESCRIPTIONS_TOPIC
+            - name: PATIENT_PROFILES_TOPIC
+              valueFrom:
+                secretKeyRef:
+                  name: elmis-kafka-sender-credentials
+                  key: PAITENT_PROFILES_TOPIC
           {{- with .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}

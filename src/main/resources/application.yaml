@@ -25,8 +25,8 @@ elmis:
     idle-interval-ms: 2000
     batch-size: 100
   topics:
-    prescriptions: prescriptions
-    patient-profiles: patient-profiles
+    prescriptions: ${PRESCRIPTIONS_TOPIC}
+    patient-profiles: ${PATIENT_PROFILES_TOPIC}
 
 management:
   endpoints:
