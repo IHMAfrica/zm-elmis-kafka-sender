@@ -29,9 +29,10 @@ public class KafkaConfig {
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 180000);
+        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 280000);
         props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 30000);
         props.put(ProducerConfig.LINGER_MS_CONFIG, 0);
+        props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 80000);
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE); // Let delivery.timeout handle it
         props.put("sasl.jaas.config", jaasConfig);
