@@ -48,6 +48,7 @@ public class ElmisSenderService {
     private final AtomicLong totalProfilesSent = new AtomicLong(0);
     private final AtomicLong totalClientProfilesSent = new AtomicLong(0);
     private final AtomicLong totalErrors = new AtomicLong(0);
+    private final AtomicLong totalSkippedInvalidRecords = new AtomicLong(0);
 
     private Disposable prescriptionPollingDisposable;
     private Disposable clientPollingDisposable;
@@ -74,8 +75,9 @@ public class ElmisSenderService {
     @PreDestroy
     public void stop() {
         log.info("Stopping ELMIS Kafka Sender Service");
-        log.info("Final stats - Prescriptions: {}, Profiles (from prescriptions): {}, Client Profiles: {}, Errors: {}",
-                totalPrescriptionsSent.get(), totalProfilesSent.get(), totalClientProfilesSent.get(), totalErrors.get());
+        log.info("Final stats - Prescriptions: {}, Profiles (from prescriptions): {}, Client Profiles: {}, Errors: {}, Skipped: {}",
+                totalPrescriptionsSent.get(), totalProfilesSent.get(), totalClientProfilesSent.get(),
+                totalErrors.get(), totalSkippedInvalidRecords.get());
 
         running.set(false);
 
@@ -88,6 +90,8 @@ public class ElmisSenderService {
 
         kafkaProducerService.close();
     }
+
+    // ==================== Prescription Polling ====================
 
     private void startPrescriptionPolling() {
         prescriptionPollingDisposable = Flux.defer(this::processPendingPrescriptions)
@@ -128,17 +132,62 @@ public class ElmisSenderService {
                     consecutiveEmptyPolls.set(0);
                     log.debug("Processing {} ELMIS prescription records", records.size());
 
-                    Map<UUID, List<ElmisLogRecord>> prescriptionGroups = records.stream()
+                    List<ElmisLogRecord> validRecords = new ArrayList<>();
+                    List<UUID> invalidRecordOids = new ArrayList<>();
+
+                    for (ElmisLogRecord record : records) {
+                        if (isValidRecord(record)) {
+                            validRecords.add(record);
+                        } else {
+                            log.warn("Skipping invalid record with Oid: {} (prescriptionUuid: {}, patientUuid: {})",
+                                    record.getOid(), record.getPrescriptionUuid(), record.getPatientUuid());
+                            invalidRecordOids.add(record.getOid());
+                            totalSkippedInvalidRecords.incrementAndGet();
+                        }
+                    }
+
+                    Mono<Void> markInvalidMono = Mono.empty();
+                    if (!invalidRecordOids.isEmpty()) {
+                        markInvalidMono = elmisLogRepository.markRecordsAsSynced(invalidRecordOids)
+                                .doOnSuccess(count -> log.info("Marked {} invalid records as synced to skip", count))
+                                .then();
+                    }
+
+                    if (validRecords.isEmpty()) {
+                        return markInvalidMono.thenReturn(invalidRecordOids.size());
+                    }
+
+                    Map<UUID, List<ElmisLogRecord>> prescriptionGroups = validRecords.stream()
                             .collect(Collectors.groupingBy(ElmisLogRecord::getPrescriptionUuid));
 
-                    return processPrescriptionGroups(prescriptionGroups)
-                            .map(List::size);
+                    return markInvalidMono
+                            .then(processPrescriptionGroups(prescriptionGroups))
+                            .map(successfulOids -> successfulOids.size() + invalidRecordOids.size());
                 })
                 .onErrorResume(e -> {
-                    log.error("Error processing prescription records", e);
+                    log.error("Error processing prescription records: {}", e.getMessage(), e);
                     totalErrors.incrementAndGet();
                     return Mono.just(0);
                 });
+    }
+
+    private boolean isValidRecord(ElmisLogRecord record) {
+        if (record == null) {
+            return false;
+        }
+        if (record.getOid() == null) {
+            log.debug("Record has null Oid");
+            return false;
+        }
+        if (record.getPrescriptionUuid() == null) {
+            log.debug("Record {} has null prescriptionUuid", record.getOid());
+            return false;
+        }
+        if (record.getPatientUuid() == null) {
+            log.debug("Record {} has null patientUuid", record.getOid());
+            return false;
+        }
+        return true;
     }
 
     private Mono<List<UUID>> processPrescriptionGroups(Map<UUID, List<ElmisLogRecord>> prescriptionGroups) {
@@ -166,45 +215,80 @@ public class ElmisSenderService {
             Set<UUID> sentPatientProfiles,
             List<UUID> successfulOids) {
 
-        if (records.isEmpty()) {
+        if (records == null || records.isEmpty()) {
             return Mono.empty();
         }
 
         ElmisLogRecord first = records.getFirst();
         UUID patientUuid = first.getPatientUuid();
         UUID prescriptionUuid = first.getPrescriptionUuid();
-        List<UUID> recordOids = records.stream().map(ElmisLogRecord::getOid).toList();
 
-        // Send patient profile first if not already sent
+        if (patientUuid == null || prescriptionUuid == null) {
+            log.warn("Skipping prescription group with null patientUuid or prescriptionUuid");
+            return Mono.empty();
+        }
+
+        List<UUID> recordOids = records.stream()
+                .map(ElmisLogRecord::getOid)
+                .filter(Objects::nonNull)
+                .toList();
+
+        if (recordOids.isEmpty()) {
+            log.warn("No valid record OIDs found for prescription {}", prescriptionUuid);
+            return Mono.empty();
+        }
+
         Mono<Boolean> profileMono;
         if (sentPatientProfiles.contains(patientUuid)) {
             profileMono = Mono.just(true);
         } else {
             String profilePayload = payloadBuilderService.buildPatientProfilePayload(first);
-            profileMono = kafkaProducerService.sendPatientProfile(profilePayload, "profile-" + patientUuid)
-                    .doOnSuccess(success -> {
-                        if (Boolean.TRUE.equals(success)) {
-                            sentPatientProfiles.add(patientUuid);
-                            log.debug("Patient profile sent for {}", patientUuid);
-                        }
-                    });
+            if (profilePayload == null || profilePayload.isEmpty()) {
+                log.warn("Failed to build patient profile payload for patient {}", patientUuid);
+                profileMono = Mono.just(false);
+            } else {
+                profileMono = kafkaProducerService.sendPatientProfile(profilePayload, "profile-" + patientUuid)
+                        .doOnSuccess(success -> {
+                            if (Boolean.TRUE.equals(success)) {
+                                sentPatientProfiles.add(patientUuid);
+                                log.debug("Patient profile sent for {}", patientUuid);
+                            }
+                        })
+                        .onErrorResume(e -> {
+                            log.error("Error sending patient profile for {}: {}", patientUuid, e.getMessage());
+                            return Mono.just(false);
+                        });
+            }
         }
 
         return profileMono.flatMap(profileSuccess -> {
             if (!profileSuccess) {
                 log.warn("Skipping prescription {} due to profile failure", prescriptionUuid);
+                totalErrors.incrementAndGet();
                 return Mono.empty();
             }
 
             String prescriptionPayload = payloadBuilderService.buildPrescriptionPayload(records);
+            if (prescriptionPayload == null || prescriptionPayload.isEmpty()) {
+                log.warn("Failed to build prescription payload for {}", prescriptionUuid);
+                totalErrors.incrementAndGet();
+                return Mono.empty();
+            }
+
             return kafkaProducerService.sendPrescription(prescriptionPayload, "prescription-" + prescriptionUuid)
                     .doOnSuccess(success -> {
                         if (Boolean.TRUE.equals(success)) {
                             successfulOids.addAll(recordOids);
                             log.debug("Prescription sent: {}", prescriptionUuid);
                         } else {
+                            log.warn("Failed to send prescription {}", prescriptionUuid);
                             totalErrors.incrementAndGet();
                         }
+                    })
+                    .onErrorResume(e -> {
+                        log.error("Error sending prescription {}: {}", prescriptionUuid, e.getMessage());
+                        totalErrors.incrementAndGet();
+                        return Mono.just(false);
                     });
         }).then();
     }
@@ -215,7 +299,6 @@ public class ElmisSenderService {
                     if (!running.get()) {
                         return Mono.empty();
                     }
-                    // Use same adaptive delay as prescriptions
                     long delay = consecutiveEmptyPolls.get() > 5 ? idleIntervalMs : pollingIntervalMs;
                     return Mono.delay(Duration.ofMillis(delay));
                 }))
@@ -227,7 +310,7 @@ public class ElmisSenderService {
                             }
                         },
                         error -> {
-                            log.error("Error in client polling loop", error);
+                            log.error("Error in client polling loop: {}", error.getMessage(), error);
                             totalErrors.incrementAndGet();
                             if (running.get()) {
                                 Mono.delay(Duration.ofSeconds(5)).subscribe(v -> startClientPolling());
@@ -247,21 +330,60 @@ public class ElmisSenderService {
 
                     log.debug("Processing {} client profile records", clients.size());
 
-                    return processClients(clients)
-                            .map(List::size);
+                    List<ClientRecord> validClients = clients.stream()
+                            .filter(this::isValidClient)
+                            .collect(Collectors.toList());
+
+                    List<UUID> invalidClientOids = clients.stream()
+                            .filter(c -> !isValidClient(c))
+                            .map(ClientRecord::getOid)
+                            .filter(Objects::nonNull)
+                            .collect(Collectors.toList());
+
+                    Mono<Void> markInvalidMono = Mono.empty();
+                    if (!invalidClientOids.isEmpty()) {
+                        log.warn("Skipping {} invalid client records", invalidClientOids.size());
+                        totalSkippedInvalidRecords.addAndGet(invalidClientOids.size());
+                        markInvalidMono = clientRepository.markClientsAsSynced(invalidClientOids)
+                                .doOnSuccess(count -> log.info("Marked {} invalid clients as synced to skip", count))
+                                .then();
+                    }
+
+                    if (validClients.isEmpty()) {
+                        return markInvalidMono.thenReturn(invalidClientOids.size());
+                    }
+
+                    return markInvalidMono
+                            .then(processClients(validClients))
+                            .map(successfulOids -> successfulOids.size() + invalidClientOids.size());
                 })
                 .onErrorResume(e -> {
-                    log.error("Error processing client records", e);
+                    log.error("Error processing client records: {}", e.getMessage(), e);
                     totalErrors.incrementAndGet();
                     return Mono.just(0);
                 });
+    }
+
+    private boolean isValidClient(ClientRecord client) {
+        if (client == null) {
+            return false;
+        }
+        if (client.getOid() == null) {
+            log.debug("Client has null Oid");
+            return false;
+        }
+        if (client.getHmisCode() == null || client.getHmisCode().isEmpty()) {
+            log.debug("Client {} has no HMIS code", client.getOid());
+            return false;
+        }
+        return true;
     }
 
     private Mono<List<UUID>> processClients(List<ClientRecord> clients) {
         List<UUID> successfulClientOids = Collections.synchronizedList(new ArrayList<>());
 
         return Flux.fromIterable(clients)
-                .flatMap(client -> processClientProfile(client, successfulClientOids), 5) // Concurrency of 5
+                .flatMap(client -> processClientProfile(client, successfulClientOids), 5)
                 .then(Mono.defer(() -> {
                     if (!successfulClientOids.isEmpty()) {
                         return clientRepository.markClientsAsSynced(successfulClientOids)
@@ -276,12 +398,13 @@ public class ElmisSenderService {
     }
 
     private Mono<Void> processClientProfile(ClientRecord client, List<UUID> successfulClientOids) {
-        if (client.getHmisCode() == null || client.getHmisCode().isEmpty()) {
-            log.warn("Client {} has no HMIS code, skipping", client.getOid());
+        String profilePayload = payloadBuilderService.buildPatientProfilePayload(client);
+
+        if (profilePayload == null || profilePayload.isEmpty()) {
+            log.warn("Failed to build patient profile payload for client {}", client.getOid());
+            totalErrors.incrementAndGet();
             return Mono.empty();
         }
-
-        String profilePayload = payloadBuilderService.buildPatientProfilePayload(client);
 
         return kafkaProducerService.sendPatientProfile(profilePayload, "client-profile-" + client.getOid())
                 .doOnSuccess(success -> {
@@ -292,6 +415,11 @@ public class ElmisSenderService {
                         log.warn("Failed to send client profile for {}", client.getOid());
                         totalErrors.incrementAndGet();
                     }
+                })
+                .onErrorResume(e -> {
+                    log.error("Error sending client profile for {}: {}", client.getOid(), e.getMessage());
+                    totalErrors.incrementAndGet();
+                    return Mono.just(false);
                 })
                 .then();
     }
