@@ -1,5 +1,6 @@
 package zm.gov.moh.elmiskafkasender.service;
 
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.springframework.beans.factory.annotation.Value;
@@ -13,6 +14,7 @@ import java.time.Duration;
 
 @Service
 @Slf4j
+@RequiredArgsConstructor
 public class KafkaProducerService {
     private final KafkaSender<String, String> kafkaSender;
 
@@ -21,10 +23,6 @@ public class KafkaProducerService {
 
     @Value("${elmis.topics.patient-profiles}")
     private String patientProfilesTopic;
-
-    public KafkaProducerService(KafkaSender<String, String> kafkaSender) {
-        this.kafkaSender = kafkaSender;
-    }
 
     public Mono<Boolean> sendPatientProfile(String payload, String correlationId) {
         return sendMessage(patientProfilesTopic, payload, correlationId)

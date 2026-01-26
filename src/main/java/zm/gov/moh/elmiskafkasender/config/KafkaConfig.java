@@ -1,6 +1,9 @@
-// src/main/java/com/carepro/elmis/config/KafkaConfig.java
 package zm.gov.moh.elmiskafkasender.config;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.StringSerializer;
@@ -49,5 +52,17 @@ public class KafkaConfig {
     @Bean
     public KafkaSender<String, String> kafkaSender(SenderOptions<String, String> senderOptions) {
         return KafkaSender.create(senderOptions);
+    }
+
+    @Bean
+    public ObjectMapper objectMapper() {
+        ObjectMapper objectMapper = new ObjectMapper();
+
+        objectMapper.setPropertyNamingStrategy(PropertyNamingStrategies.LOWER_CAMEL_CASE);
+        objectMapper.registerModule(new JavaTimeModule());
+        objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+        objectMapper.disable(SerializationFeature.INDENT_OUTPUT);
+
+        return objectMapper;
     }
 }

@@ -2,12 +2,11 @@ package zm.gov.moh.elmiskafkasender.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.PropertyNamingStrategies;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import zm.gov.moh.elmiskafkasender.dto.*;
+import zm.gov.moh.elmiskafkasender.entity.ClientRecord;
 import zm.gov.moh.elmiskafkasender.entity.ElmisLogRecord;
 
 import java.math.BigDecimal;
@@ -19,8 +18,8 @@ import java.util.UUID;
 
 @Service
 @Slf4j
+@RequiredArgsConstructor
 public class PayloadBuilderService {
-
     private static final String DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss";
     private static final String DATE_FORMAT = "yyyy-MM-dd";
     private static final DateTimeFormatter DATETIME_FORMATTER = DateTimeFormatter.ofPattern(DATETIME_FORMAT);
@@ -28,12 +27,20 @@ public class PayloadBuilderService {
 
     private final ObjectMapper objectMapper;
 
-    public PayloadBuilderService() {
-        this.objectMapper = new ObjectMapper();
-        this.objectMapper.setPropertyNamingStrategy(PropertyNamingStrategies.LOWER_CAMEL_CASE);
-        this.objectMapper.registerModule(new JavaTimeModule());
-        this.objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
-        this.objectMapper.disable(SerializationFeature.INDENT_OUTPUT);
+    public String buildPatientProfilePayload(ClientRecord client) {
+        PatientProfileDto profile = PatientProfileDto.builder()
+                .msh(buildMsh(client.getHmisCode(), "profile"))
+                .registrationDateTime(formatDateTime(client.getRegistrationDate()))
+                .dateOfBirth(formatDate(client.getDob()))
+                .patientUuid(client.getOid())
+                .nrcNumber(nullToEmpty(client.getNrc()))
+                .firstName(nullToEmpty(client.getFirstName()))
+                .lastName(nullToEmpty(client.getSurname()))
+                .patientId(nullToEmpty(client.getNupn()))
+                .sex(mapSex(client.getSex()))
+                .build();
+
+        return toJson(profile);
     }
 
     public String buildPatientProfilePayload(ElmisLogRecord record) {
@@ -46,7 +53,7 @@ public class PayloadBuilderService {
                 .firstName(nullToEmpty(record.getFirstName()))
                 .lastName(nullToEmpty(record.getLastName()))
                 .patientId(nullToEmpty(record.getPatientId()))
-                .sex(nullToEmpty(record.getSex()).equals("1") ? "Male" : "Female")
+                .sex(nullToEmpty(record.getSex()).equals("1") ? "M" : "F")
                 .build();
 
         return toJson(profile);
@@ -79,7 +86,7 @@ public class PayloadBuilderService {
 
     private MshDto buildMsh(String hmisCode, String messageType) {
         return MshDto.builder()
-                .timestamp(LocalDateTime.now().format(DATETIME_FORMATTER))
+                .timestamp(LocalDateTime.now().plusHours(2).format(DATETIME_FORMATTER))
                 .sendingApplication("CarePro")
                 .receivingApplication("elmis")
                 .messageId(UUID.randomUUID().toString())
@@ -165,6 +172,12 @@ public class PayloadBuilderService {
                 .prescriptionDrugs(drugs)
                 .date(prescriptionDate)
                 .build();
+    }
+
+    private String mapSex(Short sex) {
+        if (sex == null) return "";
+        // Assuming 0 = Male, 1 = Female based on common conventions
+        return sex == 0 ? "M" : "F";
     }
 
     private String formatDateTime(LocalDateTime dateTime) {

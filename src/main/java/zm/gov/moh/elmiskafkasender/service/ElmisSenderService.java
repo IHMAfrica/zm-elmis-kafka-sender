@@ -9,7 +9,9 @@ import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
+import zm.gov.moh.elmiskafkasender.entity.ClientRecord;
 import zm.gov.moh.elmiskafkasender.entity.ElmisLogRecord;
+import zm.gov.moh.elmiskafkasender.repository.ClientRepository;
 import zm.gov.moh.elmiskafkasender.repository.ElmisLogRepository;
 
 import java.time.Duration;
@@ -23,7 +25,9 @@ import java.util.stream.Collectors;
 @Service
 @Slf4j
 public class ElmisSenderService {
+
     private final ElmisLogRepository elmisLogRepository;
+    private final ClientRepository clientRepository;
     private final KafkaProducerService kafkaProducerService;
     private final PayloadBuilderService payloadBuilderService;
 
@@ -38,16 +42,23 @@ public class ElmisSenderService {
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicInteger consecutiveEmptyPolls = new AtomicInteger(0);
-    private final AtomicLong totalSent = new AtomicLong(0);
+
+    // Metrics
+    private final AtomicLong totalPrescriptionsSent = new AtomicLong(0);
+    private final AtomicLong totalProfilesSent = new AtomicLong(0);
+    private final AtomicLong totalClientProfilesSent = new AtomicLong(0);
     private final AtomicLong totalErrors = new AtomicLong(0);
 
-    private Disposable pollingDisposable;
+    private Disposable prescriptionPollingDisposable;
+    private Disposable clientPollingDisposable;
 
     public ElmisSenderService(
             ElmisLogRepository elmisLogRepository,
+            ClientRepository clientRepository,
             KafkaProducerService kafkaProducerService,
             PayloadBuilderService payloadBuilderService) {
         this.elmisLogRepository = elmisLogRepository;
+        this.clientRepository = clientRepository;
         this.kafkaProducerService = kafkaProducerService;
         this.payloadBuilderService = payloadBuilderService;
     }
@@ -56,22 +67,32 @@ public class ElmisSenderService {
     public void start() {
         log.info("Starting ELMIS Kafka Sender Service");
         running.set(true);
-        startPolling();
+        startPrescriptionPolling();
+        startClientPolling();
     }
 
     @PreDestroy
     public void stop() {
-        log.info("Stopping ELMIS Kafka Sender Service. Total sent: {}, Total errors: {}",
-                totalSent.get(), totalErrors.get());
+        log.info("Stopping ELMIS Kafka Sender Service");
+        log.info("Final stats - Prescriptions: {}, Profiles (from prescriptions): {}, Client Profiles: {}, Errors: {}",
+                totalPrescriptionsSent.get(), totalProfilesSent.get(), totalClientProfilesSent.get(), totalErrors.get());
+
         running.set(false);
-        if (pollingDisposable != null && !pollingDisposable.isDisposed()) {
-            pollingDisposable.dispose();
+
+        if (prescriptionPollingDisposable != null && !prescriptionPollingDisposable.isDisposed()) {
+            prescriptionPollingDisposable.dispose();
         }
+        if (clientPollingDisposable != null && !clientPollingDisposable.isDisposed()) {
+            clientPollingDisposable.dispose();
+        }
+
         kafkaProducerService.close();
     }
 
-    private void startPolling() {
-        pollingDisposable = Flux.defer(this::processPendingRecords)
+    // ==================== Prescription Polling ====================
+
+    private void startPrescriptionPolling() {
+        prescriptionPollingDisposable = Flux.defer(this::processPendingPrescriptions)
                 .repeatWhen(completed -> completed.flatMap(v -> {
                     if (!running.get()) {
                         return Mono.empty();
@@ -83,22 +104,21 @@ public class ElmisSenderService {
                 .subscribe(
                         count -> {
                             if (count > 0) {
-                                log.debug("Processed {} records", count);
+                                log.debug("Processed {} prescription records", count);
                             }
                         },
                         error -> {
-                            log.error("Error in polling loop", error);
+                            log.error("Error in prescription polling loop", error);
                             totalErrors.incrementAndGet();
                             if (running.get()) {
-                                Mono.delay(Duration.ofSeconds(5))
-                                        .subscribe(v -> startPolling());
+                                Mono.delay(Duration.ofSeconds(5)).subscribe(v -> startPrescriptionPolling());
                             }
                         },
-                        () -> log.info("Polling stopped")
+                        () -> log.info("Prescription polling stopped")
                 );
     }
 
-    private Mono<Integer> processPendingRecords() {
+    private Mono<Integer> processPendingPrescriptions() {
         return elmisLogRepository.findUnprocessedRecords(batchSize)
                 .collectList()
                 .flatMap(records -> {
@@ -108,22 +128,23 @@ public class ElmisSenderService {
                     }
 
                     consecutiveEmptyPolls.set(0);
-                    log.debug("Processing {} ELMIS records", records.size());
+                    log.debug("Processing {} ELMIS prescription records", records.size());
 
+                    // Group by prescription
                     Map<UUID, List<ElmisLogRecord>> prescriptionGroups = records.stream()
                             .collect(Collectors.groupingBy(ElmisLogRecord::getPrescriptionUuid));
 
-                    return processGroups(prescriptionGroups)
+                    return processPrescriptionGroups(prescriptionGroups)
                             .map(List::size);
                 })
                 .onErrorResume(e -> {
-                    log.error("Error processing records", e);
+                    log.error("Error processing prescription records", e);
                     totalErrors.incrementAndGet();
                     return Mono.just(0);
                 });
     }
 
-    private Mono<List<UUID>> processGroups(Map<UUID, List<ElmisLogRecord>> prescriptionGroups) {
+    private Mono<List<UUID>> processPrescriptionGroups(Map<UUID, List<ElmisLogRecord>> prescriptionGroups) {
         Set<UUID> sentPatientProfiles = ConcurrentHashMap.newKeySet();
         List<UUID> successfulOids = Collections.synchronizedList(new ArrayList<>());
 
@@ -133,8 +154,9 @@ public class ElmisSenderService {
                     if (!successfulOids.isEmpty()) {
                         return elmisLogRepository.markRecordsAsSynced(successfulOids)
                                 .doOnSuccess(count -> {
-                                    log.info("Marked {} records as synced", count);
-                                    totalSent.addAndGet(successfulOids.size());
+                                    log.info("Marked {} prescription records as synced", count);
+                                    totalPrescriptionsSent.addAndGet(prescriptionGroups.size());
+                                    totalProfilesSent.addAndGet(sentPatientProfiles.size());
                                 })
                                 .thenReturn(successfulOids);
                     }
@@ -154,9 +176,7 @@ public class ElmisSenderService {
         ElmisLogRecord first = records.getFirst();
         UUID patientUuid = first.getPatientUuid();
         UUID prescriptionUuid = first.getPrescriptionUuid();
-        List<UUID> recordOids = records.stream()
-                .map(ElmisLogRecord::getOid)
-                .toList();
+        List<UUID> recordOids = records.stream().map(ElmisLogRecord::getOid).toList();
 
         // Send patient profile first if not already sent
         Mono<Boolean> profileMono;
@@ -190,5 +210,92 @@ public class ElmisSenderService {
                         }
                     });
         }).then();
+    }
+
+    private void startClientPolling() {
+        clientPollingDisposable = Flux.defer(this::processPendingClients)
+                .repeatWhen(completed -> completed.flatMap(v -> {
+                    if (!running.get()) {
+                        return Mono.empty();
+                    }
+                    // Use same adaptive delay as prescriptions
+                    long delay = consecutiveEmptyPolls.get() > 5 ? idleIntervalMs : pollingIntervalMs;
+                    return Mono.delay(Duration.ofMillis(delay));
+                }))
+                .subscribeOn(Schedulers.boundedElastic())
+                .subscribe(
+                        count -> {
+                            if (count > 0) {
+                                log.debug("Processed {} client records", count);
+                            }
+                        },
+                        error -> {
+                            log.error("Error in client polling loop", error);
+                            totalErrors.incrementAndGet();
+                            if (running.get()) {
+                                Mono.delay(Duration.ofSeconds(5)).subscribe(v -> startClientPolling());
+                            }
+                        },
+                        () -> log.info("Client polling stopped")
+                );
+    }
+
+    private Mono<Integer> processPendingClients() {
+        return clientRepository.findUnprocessedClients(batchSize)
+                .collectList()
+                .flatMap(clients -> {
+                    if (clients.isEmpty()) {
+                        return Mono.just(0);
+                    }
+
+                    log.debug("Processing {} client profile records", clients.size());
+
+                    return processClients(clients)
+                            .map(List::size);
+                })
+                .onErrorResume(e -> {
+                    log.error("Error processing client records", e);
+                    totalErrors.incrementAndGet();
+                    return Mono.just(0);
+                });
+    }
+
+    private Mono<List<UUID>> processClients(List<ClientRecord> clients) {
+        List<UUID> successfulClientOids = Collections.synchronizedList(new ArrayList<>());
+
+        return Flux.fromIterable(clients)
+                .flatMap(client -> processClientProfile(client, successfulClientOids), 5) // Concurrency of 5
+                .then(Mono.defer(() -> {
+                    if (!successfulClientOids.isEmpty()) {
+                        return clientRepository.markClientsAsSynced(successfulClientOids)
+                                .doOnSuccess(count -> {
+                                    log.info("Marked {} client profiles as synced", count);
+                                    totalClientProfilesSent.addAndGet(successfulClientOids.size());
+                                })
+                                .thenReturn(successfulClientOids);
+                    }
+                    return Mono.just(successfulClientOids);
+                }));
+    }
+
+    private Mono<Void> processClientProfile(ClientRecord client, List<UUID> successfulClientOids) {
+        if (client.getHmisCode() == null || client.getHmisCode().isEmpty()) {
+            log.warn("Client {} has no HMIS code, skipping", client.getOid());
+            return Mono.empty();
+        }
+
+        String profilePayload = payloadBuilderService.buildPatientProfilePayload(client);
+
+        return kafkaProducerService.sendPatientProfile(profilePayload, "client-profile-" + client.getOid())
+                .doOnSuccess(success -> {
+                    if (Boolean.TRUE.equals(success)) {
+                        successfulClientOids.add(client.getOid());
+                        log.debug("Client profile sent for {}", client.getOid());
+                    } else {
+                        log.warn("Failed to send client profile for {}", client.getOid());
+                        totalErrors.incrementAndGet();
+                    }
+                })
+                .then();
     }
 }
