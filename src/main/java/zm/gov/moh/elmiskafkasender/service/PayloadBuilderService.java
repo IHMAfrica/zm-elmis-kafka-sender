@@ -5,7 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import zm.gov.moh.elmiskafkasender.dto.*;
+import zm.gov.moh.elmiskafkasender.dto.MshDto;
+import zm.gov.moh.elmiskafkasender.dto.PatientProfileDto;
 import zm.gov.moh.elmiskafkasender.entity.ClientRecord;
 import zm.gov.moh.elmiskafkasender.entity.ElmisLogRecord;
 
@@ -66,20 +67,19 @@ public class PayloadBuilderService {
 
         ElmisLogRecord first = prescriptionRecords.getFirst();
 
-        PrescriptionDto prescription = PrescriptionDto.builder()
-                .msh(buildMsh(first.getHmisCode(), "prescription"))
-                .patientUuid(first.getPatientUuid())
-                .artNumber(nullToEmpty(first.getArtNumber()))
-                .cd4(nullToEmpty(first.getCd4Count()))
-                .viralLoad(nullToEmpty(first.getViralLoad()))
-                .dateOfBled(formatDateTime(first.getDateOfBled()))
-                .regimenId(first.getRegimenId())
-                .clinicianId(first.getClinicianId())
-                .prescriptionUuid(first.getPrescriptionUuid())
-                .regimen(buildRegimen(prescriptionRecords))
-                .vitals(buildVitals(first))
-                .prescription(buildPrescriptionDrugs(prescriptionRecords))
-                .build();
+        var prescription = new java.util.LinkedHashMap<String, Object>();
+        prescription.put("msh", buildMshMap(first.getHmisCode(), "prescription"));
+        prescription.put("patientUuid", first.getPatientUuid());
+        prescription.put("artNumber", nullToEmpty(first.getArtNumber()));
+        prescription.put("cd4", nullToEmpty(first.getCd4Count()));
+        prescription.put("viralLoad", nullToEmpty(first.getViralLoad()));
+        prescription.put("dateOfBled", formatDateTime(first.getDateOfBled()));
+        prescription.put("regimenId", first.getRegimenId());
+        prescription.put("clinicianId", first.getClinicianId());
+        prescription.put("prescriptionUuid", first.getPrescriptionUuid());
+        prescription.put("regimen", buildRegimenMap(prescriptionRecords));
+        prescription.put("vitals", buildVitalsMap(first));
+        prescription.put("prescription", buildPrescriptionDrugsMap(prescriptionRecords));
 
         return toJson(prescription);
     }
@@ -96,108 +96,110 @@ public class PayloadBuilderService {
                 .build();
     }
 
-    private RegimenDto buildRegimen(List<ElmisLogRecord> records) {
+    private java.util.Map<String, Object> buildMshMap(String hmisCode, String messageType) {
+        var msh = new java.util.LinkedHashMap<String, Object>();
+        msh.put("timestamp", LocalDateTime.now().format(DATETIME_FORMATTER));
+        msh.put("sendingApplication", "CarePro");
+        msh.put("receivingApplication", "elmis");
+        msh.put("messageId", UUID.randomUUID().toString());
+        msh.put("hmisCode", hmisCode);
+        msh.put("mflCode", hmisCode);
+        msh.put("messageType", messageType);
+        return msh;
+    }
+
+    private java.util.Map<String, Object> buildRegimenMap(List<ElmisLogRecord> records) {
         ElmisLogRecord specialDrug = records.stream()
                 .filter(r -> r.getSpecialDrug() != null && r.getSpecialDrug() == 1)
                 .findFirst()
                 .orElse(null);
 
+        var regimen = new java.util.LinkedHashMap<String, Object>();
         if (specialDrug == null) {
-            return RegimenDto.builder()
-                    .medicationId("")
-                    .regimenCode("")
-                    .quantityPerDose(BigDecimal.ZERO)
-                    .dosageUnit("")
-                    .frequency("")
-                    .duration(0)
-                    .build();
+            regimen.put("medicationId", "");
+            regimen.put("regimenCode", "");
+            regimen.put("quantityPerDose", BigDecimal.ZERO);
+            regimen.put("dosageUnit", "");
+            regimen.put("frequency", "");
+            regimen.put("duration", 0);
+        } else {
+            regimen.put("medicationId", uuidToString(specialDrug.getMedicationId()));
+            regimen.put("regimenCode", nullToEmpty(specialDrug.getDrugIdentifier()));
+            regimen.put("quantityPerDose", specialDrug.getQuantityPerDose());
+            regimen.put("dosageUnit", nullToEmpty(specialDrug.getDosageUnit()));
+            regimen.put("frequency", nullToEmpty(specialDrug.getFrequency()));
+            regimen.put("duration", specialDrug.getDuration());
         }
-
-        return RegimenDto.builder()
-                .medicationId(uuidToString(specialDrug.getMedicationId()))
-                .regimenCode(nullToEmpty(specialDrug.getDrugIdentifier()))
-                .quantityPerDose(specialDrug.getQuantityPerDose())
-                .dosageUnit(nullToEmpty(specialDrug.getDosageUnit()))
-                .frequency(nullToEmpty(specialDrug.getFrequency()))
-                .duration(specialDrug.getDuration())
-                .build();
+        return regimen;
     }
 
-    private VitalsDto buildVitals(ElmisLogRecord record) {
+    private java.util.Map<String, Object> buildVitalsMap(ElmisLogRecord record) {
+        var vitals = new java.util.LinkedHashMap<String, Object>();
+
         boolean hasVitals = (record.getHeight() != null && record.getHeight().compareTo(BigDecimal.ZERO) > 0)
                 || (record.getWeight() != null && record.getWeight().compareTo(BigDecimal.ZERO) > 0)
                 || (record.getBloodPressure() != null && !record.getBloodPressure().isEmpty());
 
         if (!hasVitals) {
-            return VitalsDto.builder()
-                    .height("")
-                    .heightDateTimeCollected("")
-                    .weight("")
-                    .weightDateTimeCollected("")
-                    .bloodPressure("")
-                    .bloodPressureDateTimeCollected("")
-                    .build();
+            vitals.put("height", "");
+            vitals.put("heightDateTimeCollected", "");
+            vitals.put("weight", "");
+            vitals.put("weightDateTimeCollected", "");
+            vitals.put("bloodPressure", "");
+            vitals.put("bloodPressureDateTimeCollected", "");
+        } else {
+            vitals.put("height", formatDecimal(record.getHeight()));
+            vitals.put("heightDateTimeCollected", formatDateTime(record.getHeightDateTimeCollected()));
+            vitals.put("weight", formatDecimal(record.getWeight()));
+            vitals.put("weightDateTimeCollected", formatDateTime(record.getWeightDateTimeCollected()));
+            vitals.put("bloodPressure", nullToEmpty(record.getBloodPressure()));
+            vitals.put("bloodPressureDateTimeCollected", formatDateTime(record.getBloodPressureDateTimeCollected()));
         }
-
-        return VitalsDto.builder()
-                .height(formatDecimal(record.getHeight()))
-                .heightDateTimeCollected(formatDateTime(record.getHeightDateTimeCollected()))
-                .weight(formatDecimal(record.getWeight()))
-                .weightDateTimeCollected(formatDateTime(record.getWeightDateTimeCollected()))
-                .bloodPressure(nullToEmpty(record.getBloodPressure()))
-                .bloodPressureDateTimeCollected(formatDateTime(record.getBloodPressureDateTimeCollected()))
-                .build();
+        return vitals;
     }
 
-    private PrescriptionDrugsDto buildPrescriptionDrugs(List<ElmisLogRecord> records) {
-        List<PrescriptionDrugDto> drugs = new ArrayList<>();
+    private java.util.Map<String, Object> buildPrescriptionDrugsMap(List<ElmisLogRecord> records) {
+        List<java.util.Map<String, Object>> drugs = new ArrayList<>();
         String prescriptionDate = "";
 
         for (ElmisLogRecord record : records) {
             if (record.getSpecialDrug() == null || record.getSpecialDrug() != 1) {
-                drugs.add(PrescriptionDrugDto.builder()
-                        .medicationId(uuidToString(record.getMedicationId()))
-                        .drugCode(nullToEmpty(record.getDrugIdentifier()))
-                        .quantityPerDose(record.getQuantityPerDose())
-                        .dosageUnit(nullToEmpty(record.getDosageUnit()))
-                        .frequency(nullToEmpty(record.getFrequency()))
-                        .duration(record.getDuration())
-                        .build());
+                var drug = new java.util.LinkedHashMap<String, Object>();
+                drug.put("medicationId", uuidToString(record.getMedicationId()));
+                drug.put("drugCode", nullToEmpty(record.getDrugIdentifier()));
+                drug.put("quantityPerDose", record.getQuantityPerDose());
+                drug.put("dosageUnit", nullToEmpty(record.getDosageUnit()));
+                drug.put("frequency", nullToEmpty(record.getFrequency()));
+                drug.put("duration", record.getDuration());
+                drugs.add(drug);
 
                 prescriptionDate = formatDate(record.getPrescriptionDate());
             }
         }
 
-        return PrescriptionDrugsDto.builder()
-                .prescriptionDrugs(drugs)
-                .date(prescriptionDate)
-                .build();
+        var prescription = new java.util.LinkedHashMap<String, Object>();
+        prescription.put("prescriptionDrugs", drugs);
+        prescription.put("date", prescriptionDate);
+        return prescription;
     }
 
     private String mapSex(Short sex) {
         if (sex == null) return "";
-        // Assuming 0 = Male, 1 = Female based on common conventions
-        return sex == 0 ? "M" : "F";
+        return sex == 1 ? "M" : "F";
     }
 
     private String formatDateTime(LocalDateTime dateTime) {
-        if (dateTime == null || dateTime.equals(LocalDateTime.MIN)) {
-            return "";
-        }
+        if (dateTime == null) return "";
         return dateTime.format(DATETIME_FORMATTER);
     }
 
     private String formatDate(LocalDateTime dateTime) {
-        if (dateTime == null || dateTime.equals(LocalDateTime.MIN)) {
-            return "";
-        }
+        if (dateTime == null) return "";
         return dateTime.format(DATE_FORMATTER);
     }
 
     private String formatDecimal(BigDecimal value) {
-        if (value == null || value.compareTo(BigDecimal.ZERO) == 0) {
-            return "";
-        }
+        if (value == null || value.compareTo(BigDecimal.ZERO) == 0) return "";
         return value.setScale(2, java.math.RoundingMode.HALF_UP).toString();
     }
 

@@ -89,8 +89,6 @@ public class ElmisSenderService {
         kafkaProducerService.close();
     }
 
-    // ==================== Prescription Polling ====================
-
     private void startPrescriptionPolling() {
         prescriptionPollingDisposable = Flux.defer(this::processPendingPrescriptions)
                 .repeatWhen(completed -> completed.flatMap(v -> {
@@ -130,7 +128,6 @@ public class ElmisSenderService {
                     consecutiveEmptyPolls.set(0);
                     log.debug("Processing {} ELMIS prescription records", records.size());
 
-                    // Group by prescription
                     Map<UUID, List<ElmisLogRecord>> prescriptionGroups = records.stream()
                             .collect(Collectors.groupingBy(ElmisLogRecord::getPrescriptionUuid));
 

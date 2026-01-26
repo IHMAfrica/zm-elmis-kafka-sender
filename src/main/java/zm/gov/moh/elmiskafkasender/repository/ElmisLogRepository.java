@@ -1,78 +1,47 @@
 package zm.gov.moh.elmiskafkasender.repository;
 
+import io.r2dbc.spi.Row;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.stereotype.Repository;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import zm.gov.moh.elmiskafkasender.entity.ElmisLogRecord;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 
 @Repository
+@Slf4j
+@RequiredArgsConstructor
 public class ElmisLogRepository {
 
     private final DatabaseClient databaseClient;
 
-    public ElmisLogRepository(DatabaseClient databaseClient) {
-        this.databaseClient = databaseClient;
-    }
-
     public Flux<ElmisLogRecord> findUnprocessedRecords(int batchSize) {
         String query = """
-            SELECT TOP (:batchSize)
-                Oid, HmisCode, PatientUuid, ArtNumber, Cd4Count, ViralLoad,
-                DateOfBled, RegimenId, DrugIdentifier, MedicationId, QuantityPerDose,
-                DosageUnit, Frequency, Duration, Height, HeightDateTimeCollected,
-                Weight, WeightDateTimeCollected, BloodPressure, BloodPressureDateTimeCollected,
-                PrescriptionDate, ClinicianId, PrescriptionUuid, SpecialDrug,
-                RegistrationDateTime, DateOfBirth, NrcNumber, FirstName, LastName,
-                PatientId, Sex, IsSynced, IsDeleted
-            FROM dbo.ElmisLogs WITH (READPAST)
-            WHERE (IsSynced IS NULL OR IsSynced = 0)
-              AND (IsDeleted IS NULL OR IsDeleted = 0)
-            ORDER BY Oid ASC
-            """;
+                SELECT TOP (:batchSize)
+                    Oid, HmisCode, PatientUuid, ArtNumber, Cd4Count, ViralLoad,
+                    DateOfBled, RegimenId, DrugIdentifier, MedicationId, QuantityPerDose,
+                    DosageUnit, Frequency, Duration, Height, HeightDateTimeCollected,
+                    Weight, WeightDateTimeCollected, BloodPressure, BloodPressureDateTimeCollected,
+                    PrescriptionDate, ClinicianId, PrescriptionUuid, SpecialDrug,
+                    RegistrationDateTime, DateOfBirth, NrcNumber, FirstName, LastName,
+                    PatientId, Sex, IsSynced, IsDeleted
+                FROM dbo.ElmisLogs WITH (READPAST)
+                WHERE (IsSynced IS NULL OR IsSynced = 0)
+                  AND (IsDeleted IS NULL OR IsDeleted = 0)
+                ORDER BY Oid ASC
+                """;
 
         return databaseClient.sql(query)
                 .bind("batchSize", batchSize)
-                .map((row, metadata) -> ElmisLogRecord.builder()
-                        .oid(row.get("Oid", UUID.class))
-                        .hmisCode(row.get("HmisCode", String.class))
-                        .patientUuid(row.get("PatientUuid", UUID.class))
-                        .artNumber(row.get("ArtNumber", String.class))
-                        .cd4Count(row.get("Cd4Count", String.class))
-                        .viralLoad(row.get("ViralLoad", String.class))
-                        .dateOfBled(row.get("DateOfBled", LocalDateTime.class))
-                        .regimenId(row.get("RegimenId", Integer.class))
-                        .drugIdentifier(row.get("DrugIdentifier", String.class))
-                        .medicationId(row.get("MedicationId", UUID.class))
-                        .quantityPerDose(row.get("QuantityPerDose", java.math.BigDecimal.class))
-                        .dosageUnit(row.get("DosageUnit", String.class))
-                        .frequency(row.get("Frequency", String.class))
-                        .duration(row.get("Duration", Integer.class))
-                        .height(row.get("Height", java.math.BigDecimal.class))
-                        .heightDateTimeCollected(row.get("HeightDateTimeCollected", LocalDateTime.class))
-                        .weight(row.get("Weight", java.math.BigDecimal.class))
-                        .weightDateTimeCollected(row.get("WeightDateTimeCollected", LocalDateTime.class))
-                        .bloodPressure(row.get("BloodPressure", String.class))
-                        .bloodPressureDateTimeCollected(row.get("BloodPressureDateTimeCollected", LocalDateTime.class))
-                        .prescriptionDate(row.get("PrescriptionDate", LocalDateTime.class))
-                        .clinicianId(row.get("ClinicianId", UUID.class))
-                        .prescriptionUuid(row.get("PrescriptionUuid", UUID.class))
-                        .specialDrug(row.get("SpecialDrug", Integer.class))
-                        .registrationDateTime(row.get("RegistrationDateTime", LocalDateTime.class))
-                        .dateOfBirth(row.get("DateOfBirth", LocalDateTime.class))
-                        .nrcNumber(row.get("NrcNumber", String.class))
-                        .firstName(row.get("FirstName", String.class))
-                        .lastName(row.get("LastName", String.class))
-                        .patientId(row.get("PatientId", String.class))
-                        .sex(row.get("Sex", String.class))
-                        .isSynced(row.get("IsSynced", Boolean.class))
-                        .isDeleted(row.get("IsDeleted", Boolean.class))
-                        .build())
-                .all();
+                .map((row, metadata) -> mapToElmisLogRecord(row))
+                .all()
+                .doOnError(e -> log.error("Failed to fetch unprocessed ELMIS records", e));
     }
 
     public Mono<Long> markRecordsAsSynced(List<UUID> oids) {
@@ -81,7 +50,7 @@ public class ElmisLogRepository {
         }
 
         StringBuilder queryBuilder = new StringBuilder();
-        queryBuilder.append("UPDATE dbo.ElmisLogs SET IsSynced = 1 WHERE Oid IN (");
+        queryBuilder.append("UPDATE dbo.ElmisLogs SET IsSynced = 1, DateModified = GETDATE() WHERE Oid IN (");
 
         for (int i = 0; i < oids.size(); i++) {
             if (i > 0) {
@@ -93,6 +62,70 @@ public class ElmisLogRepository {
 
         return databaseClient.sql(queryBuilder.toString())
                 .fetch()
-                .rowsUpdated();
+                .rowsUpdated()
+                .doOnSuccess(count -> log.debug("Marked {} ELMIS records as synced", count))
+                .doOnError(e -> log.error("Failed to mark ELMIS records as synced", e));
+    }
+
+    private ElmisLogRecord mapToElmisLogRecord(Row row) {
+        return ElmisLogRecord.builder()
+                .oid(getUuid(row, "Oid"))
+                .hmisCode(getString(row, "HmisCode"))
+                .patientUuid(getUuid(row, "PatientUuid"))
+                .artNumber(getString(row, "ArtNumber"))
+                .cd4Count(getString(row, "Cd4Count"))
+                .viralLoad(getString(row, "ViralLoad"))
+                .dateOfBled(getDateTime(row, "DateOfBled"))
+                .regimenId(getInteger(row, "RegimenId"))
+                .drugIdentifier(getString(row, "DrugIdentifier"))
+                .medicationId(getUuid(row, "MedicationId"))
+                .quantityPerDose(getBigDecimal(row, "QuantityPerDose"))
+                .dosageUnit(getString(row, "DosageUnit"))
+                .frequency(getString(row, "Frequency"))
+                .duration(getInteger(row, "Duration"))
+                .height(getBigDecimal(row, "Height"))
+                .heightDateTimeCollected(getDateTime(row, "HeightDateTimeCollected"))
+                .weight(getBigDecimal(row, "Weight"))
+                .weightDateTimeCollected(getDateTime(row, "WeightDateTimeCollected"))
+                .bloodPressure(getString(row, "BloodPressure"))
+                .bloodPressureDateTimeCollected(getDateTime(row, "BloodPressureDateTimeCollected"))
+                .prescriptionDate(getDateTime(row, "PrescriptionDate"))
+                .clinicianId(getUuid(row, "ClinicianId"))
+                .prescriptionUuid(getUuid(row, "PrescriptionUuid"))
+                .specialDrug(getInteger(row, "SpecialDrug"))
+                .registrationDateTime(getDateTime(row, "RegistrationDateTime"))
+                .dateOfBirth(getDateTime(row, "DateOfBirth"))
+                .nrcNumber(getString(row, "NrcNumber"))
+                .firstName(getString(row, "FirstName"))
+                .lastName(getString(row, "LastName"))
+                .patientId(getString(row, "PatientId"))
+                .sex(getString(row, "Sex"))
+                .isSynced(getBoolean(row, "IsSynced"))
+                .isDeleted(getBoolean(row, "IsDeleted"))
+                .build();
+    }
+
+    private UUID getUuid(Row row, String col) {
+        try { return row.get(col, UUID.class); } catch (Exception e) { return null; }
+    }
+
+    private String getString(Row row, String col) {
+        try { Object v = row.get(col); return v != null ? v.toString() : null; } catch (Exception e) { return null; }
+    }
+
+    private Integer getInteger(Row row, String col) {
+        try { Object v = row.get(col); return v instanceof Number ? ((Number) v).intValue() : null; } catch (Exception e) { return null; }
+    }
+
+    private BigDecimal getBigDecimal(Row row, String col) {
+        try { return row.get(col, BigDecimal.class); } catch (Exception e) { return null; }
+    }
+
+    private LocalDateTime getDateTime(Row row, String col) {
+        try { return row.get(col, LocalDateTime.class); } catch (Exception e) { return null; }
+    }
+
+    private Boolean getBoolean(Row row, String col) {
+        try { return row.get(col, Boolean.class); } catch (Exception e) { return null; }
     }
 }
