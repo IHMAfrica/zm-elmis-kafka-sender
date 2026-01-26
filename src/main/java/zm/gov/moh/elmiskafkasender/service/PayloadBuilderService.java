@@ -98,7 +98,7 @@ public class PayloadBuilderService {
 
     private java.util.Map<String, Object> buildMshMap(String hmisCode, String messageType) {
         var msh = new java.util.LinkedHashMap<String, Object>();
-        msh.put("timestamp", LocalDateTime.now().format(DATETIME_FORMATTER));
+        msh.put("timestamp", LocalDateTime.now().plusHours(2).format(DATETIME_FORMATTER));
         msh.put("sendingApplication", "CarePro");
         msh.put("receivingApplication", "elmis");
         msh.put("messageId", UUID.randomUUID().toString());
