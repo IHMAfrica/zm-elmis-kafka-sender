@@ -2,6 +2,7 @@ package zm.gov.moh.elmiskafkasender.service;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -49,6 +50,7 @@ public class ElmisSenderService {
     private final AtomicLong totalClientProfilesSent = new AtomicLong(0);
     private final AtomicLong totalErrors = new AtomicLong(0);
     private final AtomicLong totalSkippedInvalidRecords = new AtomicLong(0);
+    private final AtomicLong totalSkippedIncompleteProfiles = new AtomicLong(0);
 
     private Disposable prescriptionPollingDisposable;
     private Disposable clientPollingDisposable;
@@ -75,9 +77,10 @@ public class ElmisSenderService {
     @PreDestroy
     public void stop() {
         log.info("Stopping ELMIS Kafka Sender Service");
-        log.info("Final stats - Prescriptions: {}, Profiles (from prescriptions): {}, Client Profiles: {}, Errors: {}, Skipped: {}",
+        log.info("Final stats - Prescriptions: {}, Profiles (from prescriptions): {}, Client Profiles: {}, " +
+                        "Errors: {}, Skipped Invalid: {}, Skipped Incomplete Profiles: {}",
                 totalPrescriptionsSent.get(), totalProfilesSent.get(), totalClientProfilesSent.get(),
-                totalErrors.get(), totalSkippedInvalidRecords.get());
+                totalErrors.get(), totalSkippedInvalidRecords.get(), totalSkippedIncompleteProfiles.get());
 
         running.set(false);
 
@@ -136,20 +139,27 @@ public class ElmisSenderService {
                     List<UUID> invalidRecordOids = new ArrayList<>();
 
                     for (ElmisLogRecord record : records) {
-                        if (isValidRecord(record)) {
+                        ValidationResult validation = validateElmisLogRecord(record);
+                        if (validation.isValid()) {
                             validRecords.add(record);
                         } else {
-                            log.warn("Skipping invalid record with Oid: {} (prescriptionUuid: {}, patientUuid: {})",
-                                    record.getOid(), record.getPrescriptionUuid(), record.getPatientUuid());
-                            invalidRecordOids.add(record.getOid());
-                            totalSkippedInvalidRecords.incrementAndGet();
+                            log.warn("Skipping invalid ELMIS record Oid: {} - Reason: {}",
+                                    record.getOid(), validation.getReason());
+                            if (record.getOid() != null) {
+                                invalidRecordOids.add(record.getOid());
+                            }
+                            if (validation.isIncompleteProfile()) {
+                                totalSkippedIncompleteProfiles.incrementAndGet();
+                            } else {
+                                totalSkippedInvalidRecords.incrementAndGet();
+                            }
                         }
                     }
 
                     Mono<Void> markInvalidMono = Mono.empty();
                     if (!invalidRecordOids.isEmpty()) {
                         markInvalidMono = elmisLogRepository.markRecordsAsSynced(invalidRecordOids)
-                                .doOnSuccess(count -> log.info("Marked {} invalid records as synced to skip", count))
+                                .doOnSuccess(count -> log.info("Marked {} invalid ELMIS records as synced to skip", count))
                                 .then();
                     }
 
@@ -157,6 +167,7 @@ public class ElmisSenderService {
                         return markInvalidMono.thenReturn(invalidRecordOids.size());
                     }
 
+                    // Group valid records by prescription UUID
                     Map<UUID, List<ElmisLogRecord>> prescriptionGroups = validRecords.stream()
                             .collect(Collectors.groupingBy(ElmisLogRecord::getPrescriptionUuid));
 
@@ -171,23 +182,32 @@ public class ElmisSenderService {
                 });
     }
 
-    private boolean isValidRecord(ElmisLogRecord record) {
+    private ValidationResult validateElmisLogRecord(ElmisLogRecord record) {
         if (record == null) {
-            return false;
+            return ValidationResult.invalid("Record is null");
         }
         if (record.getOid() == null) {
-            log.debug("Record has null Oid");
-            return false;
+            return ValidationResult.invalid("Oid is null");
         }
         if (record.getPrescriptionUuid() == null) {
-            log.debug("Record {} has null prescriptionUuid", record.getOid());
-            return false;
+            return ValidationResult.invalid("PrescriptionUuid is null");
         }
         if (record.getPatientUuid() == null) {
-            log.debug("Record {} has null patientUuid", record.getOid());
-            return false;
+            return ValidationResult.invalid("PatientUuid is null");
         }
-        return true;
+
+        // Validate patient profile fields
+        if (record.getSex() == null || record.getSex().trim().isEmpty()) {
+            return ValidationResult.incompleteProfile("Sex is null or empty");
+        }
+        if (record.getPatientId() == null || record.getPatientId().trim().isEmpty()) {
+            return ValidationResult.incompleteProfile("PatientId (NUPN) is null or empty");
+        }
+        if (record.getRegistrationDateTime() == null) {
+            return ValidationResult.incompleteProfile("RegistrationDateTime is null");
+        }
+
+        return ValidationResult.valid();
     }
 
     private Mono<List<UUID>> processPrescriptionGroups(Map<UUID, List<ElmisLogRecord>> prescriptionGroups) {
@@ -293,6 +313,8 @@ public class ElmisSenderService {
         }).then();
     }
 
+    // ==================== Client Profile Polling ====================
+
     private void startClientPolling() {
         clientPollingDisposable = Flux.defer(this::processPendingClients)
                 .repeatWhen(completed -> completed.flatMap(v -> {
@@ -330,20 +352,30 @@ public class ElmisSenderService {
 
                     log.debug("Processing {} client profile records", clients.size());
 
-                    List<ClientRecord> validClients = clients.stream()
-                            .filter(this::isValidClient)
-                            .collect(Collectors.toList());
+                    List<ClientRecord> validClients = new ArrayList<>();
+                    List<UUID> invalidClientOids = new ArrayList<>();
 
-                    List<UUID> invalidClientOids = clients.stream()
-                            .filter(c -> !isValidClient(c))
-                            .map(ClientRecord::getOid)
-                            .filter(Objects::nonNull)
-                            .collect(Collectors.toList());
+                    for (ClientRecord client : clients) {
+                        ValidationResult validation = validateClientRecord(client);
+                        if (validation.isValid()) {
+                            validClients.add(client);
+                        } else {
+                            log.warn("Skipping invalid client Oid: {} - Reason: {}",
+                                    client.getOid(), validation.getReason());
+                            if (client.getOid() != null) {
+                                invalidClientOids.add(client.getOid());
+                            }
+                            if (validation.isIncompleteProfile()) {
+                                totalSkippedIncompleteProfiles.incrementAndGet();
+                            } else {
+                                totalSkippedInvalidRecords.incrementAndGet();
+                            }
+                        }
+                    }
 
+                    // Mark invalid clients as synced
                     Mono<Void> markInvalidMono = Mono.empty();
                     if (!invalidClientOids.isEmpty()) {
-                        log.warn("Skipping {} invalid client records", invalidClientOids.size());
-                        totalSkippedInvalidRecords.addAndGet(invalidClientOids.size());
                         markInvalidMono = clientRepository.markClientsAsSynced(invalidClientOids)
                                 .doOnSuccess(count -> log.info("Marked {} invalid clients as synced to skip", count))
                                 .then();
@@ -364,19 +396,28 @@ public class ElmisSenderService {
                 });
     }
 
-    private boolean isValidClient(ClientRecord client) {
+    private ValidationResult validateClientRecord(ClientRecord client) {
         if (client == null) {
-            return false;
+            return ValidationResult.invalid("Client is null");
         }
         if (client.getOid() == null) {
-            log.debug("Client has null Oid");
-            return false;
+            return ValidationResult.invalid("Oid is null");
         }
-        if (client.getHmisCode() == null || client.getHmisCode().isEmpty()) {
-            log.debug("Client {} has no HMIS code", client.getOid());
-            return false;
+        if (client.getHmisCode() == null || client.getHmisCode().trim().isEmpty()) {
+            return ValidationResult.invalid("HMISCode is null or empty");
         }
-        return true;
+
+        if (client.getSex() == null) {
+            return ValidationResult.incompleteProfile("Sex is null");
+        }
+        if (client.getNupn() == null || client.getNupn().trim().isEmpty()) {
+            return ValidationResult.incompleteProfile("NUPN (PatientId) is null or empty");
+        }
+        if (client.getRegistrationDate() == null) {
+            return ValidationResult.incompleteProfile("RegistrationDate is null");
+        }
+
+        return ValidationResult.valid();
     }
 
     private Mono<List<UUID>> processClients(List<ClientRecord> clients) {
@@ -422,5 +463,31 @@ public class ElmisSenderService {
                     return Mono.just(false);
                 })
                 .then();
+    }
+
+    @Getter
+    private static class ValidationResult {
+        private final boolean valid;
+        private final String reason;
+        private final boolean incompleteProfile;
+
+        private ValidationResult(boolean valid, String reason, boolean incompleteProfile) {
+            this.valid = valid;
+            this.reason = reason;
+            this.incompleteProfile = incompleteProfile;
+        }
+
+        public static ValidationResult valid() {
+            return new ValidationResult(true, null, false);
+        }
+
+        public static ValidationResult invalid(String reason) {
+            return new ValidationResult(false, reason, false);
+        }
+
+        public static ValidationResult incompleteProfile(String reason) {
+            return new ValidationResult(false, reason, true);
+        }
+
     }
 }
