@@ -196,10 +196,6 @@ public class ElmisSenderService {
             return ValidationResult.invalid("PatientUuid is null");
         }
 
-        // Validate patient profile fields
-        if (record.getSex() == null || record.getSex().trim().isEmpty()) {
-            return ValidationResult.incompleteProfile("Sex is null or empty");
-        }
         if (record.getPatientId() == null || record.getPatientId().trim().isEmpty()) {
             return ValidationResult.incompleteProfile("PatientId (NUPN) is null or empty");
         }
