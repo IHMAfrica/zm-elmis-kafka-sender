@@ -39,6 +39,6 @@ management:
 
 logging:
   level:
-    com.carepro: DEBUG
+    zm.gov.moh.elmiskafkasender: DEBUG
     org.springframework.kafka: INFO
     io.r2dbc.mssql: INFO

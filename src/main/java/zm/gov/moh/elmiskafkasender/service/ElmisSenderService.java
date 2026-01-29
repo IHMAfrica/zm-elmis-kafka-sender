@@ -403,9 +403,6 @@ public class ElmisSenderService {
             return ValidationResult.invalid("HMISCode is null or empty");
         }
 
-        if (client.getSex() == null) {
-            return ValidationResult.incompleteProfile("Sex is null");
-        }
         if (client.getNupn() == null || client.getNupn().trim().isEmpty()) {
             return ValidationResult.incompleteProfile("NUPN (PatientId) is null or empty");
         }
