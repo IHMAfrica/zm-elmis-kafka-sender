@@ -44,6 +44,18 @@ public class ElmisLogRepository {
                 .doOnError(e -> log.error("Failed to fetch unprocessed ELMIS records", e));
     }
 
+    public Flux<Integer> findPREPAndPEPRegimenIds() {
+        String query = """
+                SELECT RegimenId FROM dbo.SpecialDrugs sd JOIN dbo.DrugRegimens dr
+                ON dr.Oid = sd.RegimenId WHERE dr.Oid in (14)
+                """;
+
+        return databaseClient.sql(query)
+                .map((row, metadata) -> getInteger(row, "RegimenId"))
+                .all()
+                .doOnError(e -> log.error("Failed to fetch PREP and PEP regimen ids", e));
+    }
+
     public Mono<Long> markRecordsAsSynced(List<UUID> oids) {
         if (oids == null || oids.isEmpty()) {
             return Mono.just(0L);

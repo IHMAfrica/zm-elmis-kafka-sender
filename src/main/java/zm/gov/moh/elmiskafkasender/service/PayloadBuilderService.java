@@ -15,7 +15,9 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 @Service
 @Slf4j
@@ -60,17 +62,22 @@ public class PayloadBuilderService {
         return toJson(profile);
     }
 
-    public String buildPrescriptionPayload(List<ElmisLogRecord> prescriptionRecords) {
+    public String buildPrescriptionPayload(List<ElmisLogRecord> prescriptionRecords, Set<Integer> prepPepRegimenIds) {
         if (prescriptionRecords == null || prescriptionRecords.isEmpty()) {
             return null;
         }
 
         ElmisLogRecord first = prescriptionRecords.getFirst();
 
+        boolean isPrepOrPep = prepPepRegimenIds != null
+                && first.getRegimenId() != null
+                && prepPepRegimenIds.contains(first.getRegimenId());
+        String artNumber = isPrepOrPep ? generateRandomArtNumber() : nullToEmpty(first.getArtNumber());
+
         var prescription = new java.util.LinkedHashMap<String, Object>();
         prescription.put("msh", buildMshMap(first.getHmisCode(), "prescription"));
         prescription.put("patientUuid", first.getPatientUuid());
-        prescription.put("artNumber", nullToEmpty(first.getArtNumber()));
+        prescription.put("artNumber", artNumber);
         prescription.put("cd4", nullToEmpty(first.getCd4Count()));
         prescription.put("viralLoad", nullToEmpty(first.getViralLoad()));
         prescription.put("dateOfBled", formatDateTime(first.getDateOfBled()));
@@ -201,6 +208,16 @@ public class PayloadBuilderService {
     private String formatDecimal(BigDecimal value) {
         if (value == null || value.compareTo(BigDecimal.ZERO) == 0) return "";
         return value.setScale(2, java.math.RoundingMode.HALF_UP).toString();
+    }
+
+    private String generateRandomArtNumber() {
+        String chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        StringBuilder sb = new StringBuilder("sp-");
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        for (int i = 0; i < 5; i++) {
+            sb.append(chars.charAt(random.nextInt(chars.length())));
+        }
+        return sb.toString();
     }
 
     private String nullToEmpty(String value) {

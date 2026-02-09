@@ -52,6 +52,8 @@ public class ElmisSenderService {
     private final AtomicLong totalSkippedInvalidRecords = new AtomicLong(0);
     private final AtomicLong totalSkippedIncompleteProfiles = new AtomicLong(0);
 
+    private Set<Integer> prepPepRegimenIds = Collections.emptySet();
+
     private Disposable prescriptionPollingDisposable;
     private Disposable clientPollingDisposable;
 
@@ -69,6 +71,16 @@ public class ElmisSenderService {
     @PostConstruct
     public void start() {
         log.info("Starting ELMIS Kafka Sender Service");
+
+        try {
+            prepPepRegimenIds = elmisLogRepository.findPREPAndPEPRegimenIds()
+                    .collect(Collectors.toSet())
+                    .blockOptional()
+                    .orElse(Collections.emptySet());
+        } catch (Exception e) {
+            prepPepRegimenIds = Collections.emptySet();
+        }
+
         running.set(true);
         startPrescriptionPolling();
         startClientPolling();
@@ -284,7 +296,7 @@ public class ElmisSenderService {
                 return Mono.empty();
             }
 
-            String prescriptionPayload = payloadBuilderService.buildPrescriptionPayload(records);
+            String prescriptionPayload = payloadBuilderService.buildPrescriptionPayload(records, prepPepRegimenIds);
             if (prescriptionPayload == null || prescriptionPayload.isEmpty()) {
                 log.warn("Failed to build prescription payload for {}", prescriptionUuid);
                 totalErrors.incrementAndGet();
