@@ -1,4 +1,4 @@
-defaultNamespace: elmis-kafka-sender
+defaultNamespace: elmis-kafka-sender-dfz
 helm:
   releaseName: elmis-kafka-sender
   chart: ./elmis-kafka-sender-chart
