@@ -39,6 +39,6 @@ management:
 
 logging:
   level:
-    zm.gov.moh.elmiskafkasender: DEBUG
+    zm.gov.moh.elmiskafkasender: info
     org.springframework.kafka: INFO
     io.r2dbc.mssql: INFO
