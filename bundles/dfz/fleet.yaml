@@ -1,6 +1,6 @@
 defaultNamespace: elmis-kafka-sender-dfz
 helm:
-  chart: ./elmis-kafka-sender-chart
+  chart: elmis-kafka-sender-chart
   releaseName: elmis-kafka-sender-dfz
   values:
     dbCredentialsSecret: elmis-kafka-sender-dfz-credentials

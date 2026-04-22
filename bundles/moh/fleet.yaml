@@ -1,6 +1,6 @@
 defaultNamespace: elmis-kafka-sender
 helm:
-  chart: ./elmis-kafka-sender-chart
+  chart: elmis-kafka-sender-chart
   releaseName: elmis-kafka-sender
   values:
     dbCredentialsSecret: elmis-kafka-sender-credentials
