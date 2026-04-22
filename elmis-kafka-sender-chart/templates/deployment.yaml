@@ -48,47 +48,47 @@ spec:
             - name: DB_HOST
               valueFrom:
                 secretKeyRef:
-                  name: elmis-kafka-sender-credentials
+                  name: {{ .Values.dbCredentialsSecret }}
                   key: DB_HOST
             - name: DB_PORT
               valueFrom:
                 secretKeyRef:
-                  name: elmis-kafka-sender-credentials
+                  name: {{ .Values.dbCredentialsSecret }}
                   key: DB_PORT
             - name: DB_NAME
               valueFrom:
                 secretKeyRef:
-                  name: elmis-kafka-sender-credentials
+                  name: {{ .Values.dbCredentialsSecret }}
                   key: DB_NAME
             - name: DB_USERNAME
               valueFrom:
                 secretKeyRef:
-                  name: elmis-kafka-sender-credentials
+                  name: {{ .Values.dbCredentialsSecret }}
                   key: DB_USERNAME
             - name: DB_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: elmis-kafka-sender-credentials
+                  name: {{ .Values.dbCredentialsSecret }}
                   key: DB_PASSWORD
             - name: KAFKA_BOOTSTRAP_SERVERS
               valueFrom:
                 secretKeyRef:
-                  name: elmis-kafka-sender-credentials
+                  name: {{ .Values.dbCredentialsSecret }}
                   key: KAFKA_BOOTSTRAP_SERVERS
             - name: KAFKA_JAAS_CONFIG
               valueFrom:
                 secretKeyRef:
-                  name: elmis-kafka-sender-credentials
+                  name: {{ .Values.dbCredentialsSecret }}
                   key: KAFKA_JAAS_CONFIG
             - name: PRESCRIPTIONS_TOPIC
               valueFrom:
                 secretKeyRef:
-                  name: elmis-kafka-sender-credentials
+                  name: {{ .Values.dbCredentialsSecret }}
                   key: PRESCRIPTIONS_TOPIC
             - name: PATIENT_PROFILES_TOPIC
               valueFrom:
                 secretKeyRef:
-                  name: elmis-kafka-sender-credentials
+                  name: {{ .Values.dbCredentialsSecret }}
                   key: PATIENT_PROFILES_TOPIC
           {{- with .Values.livenessProbe }}
           livenessProbe:
