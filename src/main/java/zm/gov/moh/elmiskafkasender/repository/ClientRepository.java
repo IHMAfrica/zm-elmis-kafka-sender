@@ -10,6 +10,7 @@ import reactor.core.publisher.Mono;
 import zm.gov.moh.elmiskafkasender.entity.ClientRecord;
 
 import java.time.LocalDateTime;
+import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
@@ -20,7 +21,14 @@ public class ClientRepository {
 
     private final DatabaseClient databaseClient;
 
-    public Flux<ClientRecord> findUnprocessedClients(int batchSize) {
+    /**
+     * Fetches the next batch of unsent clients, skipping any that are currently quarantined.
+     * Clients are ordered by DateCreated, so without the exclusion a permanently failing client
+     * sits at the head of the queue and blocks every newer registration behind it.
+     */
+    public Flux<ClientRecord> findUnprocessedClients(int batchSize, Collection<UUID> excludedOids) {
+        List<UUID> excluded = excludedOids == null ? List.of() : List.copyOf(excludedOids);
+
         String query = """
                 SELECT TOP (:batchSize)
                     c.Oid,
@@ -42,14 +50,32 @@ public class ClientRepository {
                 LEFT JOIN dbo.Facilities f ON c.CreatedIn = f.Oid
                 WHERE (c.ELMISSyncStatus IS NULL OR c.ELMISSyncStatus = 0)
                   AND (c.IsDeleted IS NULL OR c.IsDeleted = 0)
-                ORDER BY c.DateCreated ASC
-                """;
+                """
+                + buildExclusionClause(excluded)
+                + " ORDER BY c.DateCreated ASC";
 
-        return databaseClient.sql(query)
-                .bind("batchSize", batchSize)
-                .map((row, metadata) -> mapToClientRecord(row))
+        DatabaseClient.GenericExecuteSpec spec = databaseClient.sql(query).bind("batchSize", batchSize);
+        for (int i = 0; i < excluded.size(); i++) {
+            spec = spec.bind("ex" + i, excluded.get(i));
+        }
+
+        return spec.map((row, metadata) -> mapToClientRecord(row))
                 .all()
                 .doOnError(e -> log.error("Failed to fetch unprocessed clients", e));
+    }
+
+    private String buildExclusionClause(List<UUID> excluded) {
+        if (excluded.isEmpty()) {
+            return "";
+        }
+        StringBuilder clause = new StringBuilder(" AND c.Oid NOT IN (");
+        for (int i = 0; i < excluded.size(); i++) {
+            if (i > 0) {
+                clause.append(", ");
+            }
+            clause.append(":ex").append(i);
+        }
+        return clause.append(")").toString();
     }
 
     public Mono<Long> markClientsAsSynced(List<UUID> clientOids) {

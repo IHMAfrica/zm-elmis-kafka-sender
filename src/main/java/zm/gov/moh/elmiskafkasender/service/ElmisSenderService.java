@@ -27,6 +27,15 @@ import java.util.stream.Collectors;
 @Slf4j
 public class ElmisSenderService {
 
+    /**
+     * Upper bound on how many UUIDs are pushed into the NOT IN clause of a poll query. Anything
+     * beyond this stays visible to the query and simply gets retried - degraded, but never fatal.
+     */
+    private static final int MAX_EXCLUSIONS = 500;
+
+    /** Hard cap on quarantine bookkeeping so a pathological run cannot grow the map without end. */
+    private static final int MAX_QUARANTINE_ENTRIES = 5000;
+
     private final ElmisLogRepository elmisLogRepository;
     private final ClientRepository clientRepository;
     private final KafkaProducerService kafkaProducerService;
@@ -41,8 +50,15 @@ public class ElmisSenderService {
     @Value("${elmis.polling.batch-size}")
     private int batchSize;
 
+    @Value("${elmis.polling.quarantine-base-backoff-ms:30000}")
+    private long quarantineBaseBackoffMs;
+
+    @Value("${elmis.polling.quarantine-max-backoff-ms:1800000}")
+    private long quarantineMaxBackoffMs;
+
     private final AtomicBoolean running = new AtomicBoolean(false);
-    private final AtomicInteger consecutiveEmptyPolls = new AtomicInteger(0);
+    private final AtomicInteger prescriptionEmptyPolls = new AtomicInteger(0);
+    private final AtomicInteger clientEmptyPolls = new AtomicInteger(0);
 
     // Metrics
     private final AtomicLong totalPrescriptionsSent = new AtomicLong(0);
@@ -51,6 +67,15 @@ public class ElmisSenderService {
     private final AtomicLong totalErrors = new AtomicLong(0);
     private final AtomicLong totalSkippedInvalidRecords = new AtomicLong(0);
     private final AtomicLong totalSkippedIncompleteProfiles = new AtomicLong(0);
+    private final AtomicLong totalPrescriptionsSentWithoutProfile = new AtomicLong(0);
+
+    /**
+     * Prescriptions and clients that failed to send, held out of the poll query until their
+     * backoff expires. Entries are deliberately never marked as synced - quarantine defers work,
+     * it does not discard it, so nothing is lost and a restart re-tries everything.
+     */
+    private final Map<UUID, Quarantine> quarantinedPrescriptions = new ConcurrentHashMap<>();
+    private final Map<UUID, Quarantine> quarantinedClients = new ConcurrentHashMap<>();
 
     private Set<Integer> prepPepRegimenIds = Collections.emptySet();
 
@@ -90,9 +115,12 @@ public class ElmisSenderService {
     public void stop() {
         log.info("Stopping ELMIS Kafka Sender Service");
         log.info("Final stats - Prescriptions: {}, Profiles (from prescriptions): {}, Client Profiles: {}, " +
-                        "Errors: {}, Skipped Invalid: {}, Skipped Incomplete Profiles: {}",
+                        "Errors: {}, Skipped Invalid: {}, Skipped Incomplete Profiles: {}, " +
+                        "Prescriptions sent without profile: {}, Quarantined (prescriptions/clients): {}/{}",
                 totalPrescriptionsSent.get(), totalProfilesSent.get(), totalClientProfilesSent.get(),
-                totalErrors.get(), totalSkippedInvalidRecords.get(), totalSkippedIncompleteProfiles.get());
+                totalErrors.get(), totalSkippedInvalidRecords.get(), totalSkippedIncompleteProfiles.get(),
+                totalPrescriptionsSentWithoutProfile.get(),
+                quarantinedPrescriptions.size(), quarantinedClients.size());
 
         running.set(false);
 
@@ -114,8 +142,7 @@ public class ElmisSenderService {
                     if (!running.get()) {
                         return Mono.empty();
                     }
-                    long delay = consecutiveEmptyPolls.get() > 5 ? idleIntervalMs : pollingIntervalMs;
-                    return Mono.delay(Duration.ofMillis(delay));
+                    return Mono.delay(Duration.ofMillis(nextDelay(prescriptionEmptyPolls)));
                 }))
                 .subscribeOn(Schedulers.boundedElastic())
                 .subscribe(
@@ -136,15 +163,17 @@ public class ElmisSenderService {
     }
 
     private Mono<Integer> processPendingPrescriptions() {
-        return elmisLogRepository.findUnprocessedRecords(batchSize)
+        List<UUID> excluded = activeQuarantine(quarantinedPrescriptions, "prescription");
+
+        return elmisLogRepository.findUnprocessedRecords(batchSize, excluded)
                 .collectList()
                 .flatMap(records -> {
                     if (records.isEmpty()) {
-                        consecutiveEmptyPolls.incrementAndGet();
+                        prescriptionEmptyPolls.incrementAndGet();
                         return Mono.just(0);
                     }
 
-                    consecutiveEmptyPolls.set(0);
+                    prescriptionEmptyPolls.set(0);
                     log.debug("Processing {} ELMIS prescription records", records.size());
 
                     List<ElmisLogRecord> validRecords = new ArrayList<>();
@@ -155,23 +184,19 @@ public class ElmisSenderService {
                         if (validation.isValid()) {
                             validRecords.add(record);
                         } else {
-                            log.warn("Skipping invalid ELMIS record Oid: {} - Reason: {}",
+                            log.warn("Skipping unusable ELMIS record Oid: {} - Reason: {}",
                                     record.getOid(), validation.getReason());
                             if (record.getOid() != null) {
                                 invalidRecordOids.add(record.getOid());
                             }
-                            if (validation.isIncompleteProfile()) {
-                                totalSkippedIncompleteProfiles.incrementAndGet();
-                            } else {
-                                totalSkippedInvalidRecords.incrementAndGet();
-                            }
+                            totalSkippedInvalidRecords.incrementAndGet();
                         }
                     }
 
                     Mono<Void> markInvalidMono = Mono.empty();
                     if (!invalidRecordOids.isEmpty()) {
                         markInvalidMono = elmisLogRepository.markRecordsAsSynced(invalidRecordOids)
-                                .doOnSuccess(count -> log.info("Marked {} invalid ELMIS records as synced to skip", count))
+                                .doOnSuccess(count -> log.info("Marked {} unusable ELMIS records as synced to skip", count))
                                 .then();
                     }
 
@@ -194,6 +219,11 @@ public class ElmisSenderService {
                 });
     }
 
+    /**
+     * Only rejects records that cannot be routed at all. A missing NUPN or registration date makes
+     * the <em>patient profile</em> incomplete, not the prescription - those records stay in play so
+     * the prescription is still delivered. See {@link #hasCompleteProfile}.
+     */
     private ValidationResult validateElmisLogRecord(ElmisLogRecord record) {
         if (record == null) {
             return ValidationResult.invalid("Record is null");
@@ -208,14 +238,14 @@ public class ElmisSenderService {
             return ValidationResult.invalid("PatientUuid is null");
         }
 
-        if (record.getPatientId() == null || record.getPatientId().trim().isEmpty()) {
-            return ValidationResult.incompleteProfile("PatientId (NUPN) is null or empty");
-        }
-        if (record.getRegistrationDateTime() == null) {
-            return ValidationResult.incompleteProfile("RegistrationDateTime is null");
-        }
-
         return ValidationResult.valid();
+    }
+
+    /** A profile is only sendable when ELMIS can key it - NUPN plus a registration date. */
+    private boolean hasCompleteProfile(ElmisLogRecord record) {
+        return record.getPatientId() != null
+                && !record.getPatientId().trim().isEmpty()
+                && record.getRegistrationDateTime() != null;
     }
 
     private Mono<List<UUID>> processPrescriptionGroups(Map<UUID, List<ElmisLogRecord>> prescriptionGroups) {
@@ -227,17 +257,17 @@ public class ElmisSenderService {
                 .then(Mono.defer(() -> {
                     if (!successfulOids.isEmpty()) {
                         return elmisLogRepository.markRecordsAsSynced(successfulOids)
-                                .doOnSuccess(count -> {
-                                    log.info("Marked {} prescription records as synced", count);
-                                    totalPrescriptionsSent.addAndGet(prescriptionGroups.size());
-                                    totalProfilesSent.addAndGet(sentPatientProfiles.size());
-                                })
+                                .doOnSuccess(count -> log.info("Marked {} prescription records as synced", count))
                                 .thenReturn(successfulOids);
                     }
                     return Mono.just(successfulOids);
                 }));
     }
 
+    /**
+     * Sends one prescription. The patient profile is attempted first but is strictly best-effort:
+     * a missing or failed profile is logged and the prescription goes out regardless.
+     */
     private Mono<Void> processPrescriptionGroup(
             List<ElmisLogRecord> records,
             Set<UUID> sentPatientProfiles,
@@ -266,59 +296,81 @@ public class ElmisSenderService {
             return Mono.empty();
         }
 
-        Mono<Boolean> profileMono;
-        if (sentPatientProfiles.contains(patientUuid)) {
-            profileMono = Mono.just(true);
-        } else {
-            String profilePayload = payloadBuilderService.buildPatientProfilePayload(first);
-            if (profilePayload == null || profilePayload.isEmpty()) {
-                log.warn("Failed to build patient profile payload for patient {}", patientUuid);
-                profileMono = Mono.just(false);
-            } else {
-                profileMono = kafkaProducerService.sendPatientProfile(profilePayload, "profile-" + patientUuid)
-                        .doOnSuccess(success -> {
-                            if (Boolean.TRUE.equals(success)) {
-                                sentPatientProfiles.add(patientUuid);
-                                log.debug("Patient profile sent for {}", patientUuid);
-                            }
-                        })
-                        .onErrorResume(e -> {
-                            log.error("Error sending patient profile for {}: {}", patientUuid, e.getMessage());
-                            return Mono.just(false);
-                        });
-            }
+        String prescriptionPayload = payloadBuilderService.buildPrescriptionPayload(records, prepPepRegimenIds);
+        if (prescriptionPayload == null || prescriptionPayload.isEmpty()) {
+            log.error("Failed to build prescription payload for {}", prescriptionUuid);
+            totalErrors.incrementAndGet();
+            quarantine(quarantinedPrescriptions, prescriptionUuid, "prescription", "payload could not be built");
+            return Mono.empty();
         }
 
-        return profileMono.flatMap(profileSuccess -> {
-            if (!profileSuccess) {
-                log.warn("Skipping prescription {} due to profile failure", prescriptionUuid);
-                totalErrors.incrementAndGet();
-                return Mono.empty();
-            }
-
-            String prescriptionPayload = payloadBuilderService.buildPrescriptionPayload(records, prepPepRegimenIds);
-            if (prescriptionPayload == null || prescriptionPayload.isEmpty()) {
-                log.warn("Failed to build prescription payload for {}", prescriptionUuid);
-                totalErrors.incrementAndGet();
-                return Mono.empty();
-            }
-
-            return kafkaProducerService.sendPrescription(prescriptionPayload, "prescription-" + prescriptionUuid)
-                    .doOnSuccess(success -> {
-                        if (Boolean.TRUE.equals(success)) {
-                            successfulOids.addAll(recordOids);
-                            log.debug("Prescription sent: {}", prescriptionUuid);
-                        } else {
-                            log.warn("Failed to send prescription {}", prescriptionUuid);
-                            totalErrors.incrementAndGet();
-                        }
-                    })
-                    .onErrorResume(e -> {
-                        log.error("Error sending prescription {}: {}", prescriptionUuid, e.getMessage());
+        return sendProfileBestEffort(first, patientUuid, prescriptionUuid, sentPatientProfiles)
+                .then(kafkaProducerService.sendPrescription(prescriptionPayload, "prescription-" + prescriptionUuid))
+                .defaultIfEmpty(false)
+                .onErrorResume(e -> {
+                    log.error("Error sending prescription {}: {}", prescriptionUuid, e.getMessage());
+                    return Mono.just(false);
+                })
+                .doOnNext(success -> {
+                    if (Boolean.TRUE.equals(success)) {
+                        successfulOids.addAll(recordOids);
+                        totalPrescriptionsSent.incrementAndGet();
+                        quarantinedPrescriptions.remove(prescriptionUuid);
+                        log.debug("Prescription sent: {}", prescriptionUuid);
+                    } else {
                         totalErrors.incrementAndGet();
-                        return Mono.just(false);
-                    });
-        }).then();
+                        quarantine(quarantinedPrescriptions, prescriptionUuid, "prescription", "kafka send failed");
+                    }
+                })
+                .then();
+    }
+
+    /**
+     * Publishes the patient profile if it is complete and not already sent in this batch. Never
+     * errors and never short-circuits the caller - the returned Mono always completes.
+     */
+    private Mono<Void> sendProfileBestEffort(
+            ElmisLogRecord record, UUID patientUuid, UUID prescriptionUuid, Set<UUID> sentPatientProfiles) {
+
+        if (sentPatientProfiles.contains(patientUuid)) {
+            return Mono.empty();
+        }
+
+        if (!hasCompleteProfile(record)) {
+            log.warn("Patient profile for {} is incomplete (NUPN/registration date missing); " +
+                    "sending prescription {} without it", patientUuid, prescriptionUuid);
+            totalSkippedIncompleteProfiles.incrementAndGet();
+            totalPrescriptionsSentWithoutProfile.incrementAndGet();
+            return Mono.empty();
+        }
+
+        String profilePayload = payloadBuilderService.buildPatientProfilePayload(record);
+        if (profilePayload == null || profilePayload.isEmpty()) {
+            log.warn("Failed to build patient profile payload for patient {}; " +
+                    "sending prescription {} without it", patientUuid, prescriptionUuid);
+            totalPrescriptionsSentWithoutProfile.incrementAndGet();
+            return Mono.empty();
+        }
+
+        return kafkaProducerService.sendPatientProfile(profilePayload, "profile-" + patientUuid)
+                .defaultIfEmpty(false)
+                .onErrorResume(e -> {
+                    log.error("Error sending patient profile for {}: {}", patientUuid, e.getMessage());
+                    return Mono.just(false);
+                })
+                .doOnNext(success -> {
+                    if (Boolean.TRUE.equals(success)) {
+                        sentPatientProfiles.add(patientUuid);
+                        totalProfilesSent.incrementAndGet();
+                        log.debug("Patient profile sent for {}", patientUuid);
+                    } else {
+                        log.warn("Patient profile send failed for {}; sending prescription {} anyway",
+                                patientUuid, prescriptionUuid);
+                        totalErrors.incrementAndGet();
+                        totalPrescriptionsSentWithoutProfile.incrementAndGet();
+                    }
+                })
+                .then();
     }
 
     // ==================== Client Profile Polling ====================
@@ -329,8 +381,7 @@ public class ElmisSenderService {
                     if (!running.get()) {
                         return Mono.empty();
                     }
-                    long delay = consecutiveEmptyPolls.get() > 5 ? idleIntervalMs : pollingIntervalMs;
-                    return Mono.delay(Duration.ofMillis(delay));
+                    return Mono.delay(Duration.ofMillis(nextDelay(clientEmptyPolls)));
                 }))
                 .subscribeOn(Schedulers.boundedElastic())
                 .subscribe(
@@ -351,13 +402,17 @@ public class ElmisSenderService {
     }
 
     private Mono<Integer> processPendingClients() {
-        return clientRepository.findUnprocessedClients(batchSize)
+        List<UUID> excluded = activeQuarantine(quarantinedClients, "client");
+
+        return clientRepository.findUnprocessedClients(batchSize, excluded)
                 .collectList()
                 .flatMap(clients -> {
                     if (clients.isEmpty()) {
+                        clientEmptyPolls.incrementAndGet();
                         return Mono.just(0);
                     }
 
+                    clientEmptyPolls.set(0);
                     log.debug("Processing {} client profile records", clients.size());
 
                     List<ClientRecord> validClients = new ArrayList<>();
@@ -447,27 +502,99 @@ public class ElmisSenderService {
         String profilePayload = payloadBuilderService.buildPatientProfilePayload(client);
 
         if (profilePayload == null || profilePayload.isEmpty()) {
-            log.warn("Failed to build patient profile payload for client {}", client.getOid());
+            log.error("Failed to build patient profile payload for client {}", client.getOid());
             totalErrors.incrementAndGet();
+            quarantine(quarantinedClients, client.getOid(), "client", "payload could not be built");
             return Mono.empty();
         }
 
         return kafkaProducerService.sendPatientProfile(profilePayload, "client-profile-" + client.getOid())
-                .doOnSuccess(success -> {
-                    if (Boolean.TRUE.equals(success)) {
-                        successfulClientOids.add(client.getOid());
-                        log.debug("Client profile sent for {}", client.getOid());
-                    } else {
-                        log.warn("Failed to send client profile for {}", client.getOid());
-                        totalErrors.incrementAndGet();
-                    }
-                })
+                .defaultIfEmpty(false)
                 .onErrorResume(e -> {
                     log.error("Error sending client profile for {}: {}", client.getOid(), e.getMessage());
-                    totalErrors.incrementAndGet();
                     return Mono.just(false);
                 })
+                .doOnNext(success -> {
+                    if (Boolean.TRUE.equals(success)) {
+                        successfulClientOids.add(client.getOid());
+                        quarantinedClients.remove(client.getOid());
+                        log.debug("Client profile sent for {}", client.getOid());
+                    } else {
+                        totalErrors.incrementAndGet();
+                        quarantine(quarantinedClients, client.getOid(), "client", "kafka send failed");
+                    }
+                })
                 .then();
+    }
+
+    // ==================== Quarantine ====================
+
+    private long nextDelay(AtomicInteger emptyPolls) {
+        return emptyPolls.get() > 5 ? idleIntervalMs : pollingIntervalMs;
+    }
+
+    /**
+     * Parks a failing item behind an exponential backoff so it stops occupying the batch. The row
+     * is left unsynced, so it is retried once the backoff expires and again after any restart.
+     */
+    private void quarantine(Map<UUID, Quarantine> registry, UUID id, String kind, String reason) {
+        if (id == null) {
+            return;
+        }
+
+        Quarantine entry = registry.compute(id, (key, existing) -> {
+            int attempts = existing == null ? 1 : existing.attempts() + 1;
+            long backoff = Math.min(
+                    quarantineBaseBackoffMs << Math.min(attempts - 1, 16),
+                    quarantineMaxBackoffMs);
+            return new Quarantine(attempts, System.currentTimeMillis() + backoff);
+        });
+
+        log.warn("Quarantined {} {} after {} failed attempt(s) ({}); retrying in {}s",
+                kind, id, entry.attempts(), reason,
+                Math.max(0, entry.retryAtMs() - System.currentTimeMillis()) / 1000);
+
+        pruneQuarantine(registry);
+    }
+
+    /** Returns the ids still inside their backoff window, i.e. those to hide from the next poll. */
+    private List<UUID> activeQuarantine(Map<UUID, Quarantine> registry, String kind) {
+        if (registry.isEmpty()) {
+            return List.of();
+        }
+
+        long now = System.currentTimeMillis();
+        List<Map.Entry<UUID, Quarantine>> notDue = registry.entrySet().stream()
+                .filter(e -> e.getValue().retryAtMs() > now)
+                .sorted(Comparator.comparingLong((Map.Entry<UUID, Quarantine> e) -> e.getValue().retryAtMs())
+                        .reversed())
+                .toList();
+
+        if (notDue.size() > MAX_EXCLUSIONS) {
+            log.warn("{} {} items quarantined, exceeding the {} exclusion limit - the remainder will be " +
+                            "re-read and retried on every poll until the backlog clears",
+                    notDue.size(), kind, MAX_EXCLUSIONS);
+            notDue = notDue.subList(0, MAX_EXCLUSIONS);
+        }
+
+        return notDue.stream().map(Map.Entry::getKey).toList();
+    }
+
+    /** Drops the entries closest to being due once the registry grows past its cap. */
+    private void pruneQuarantine(Map<UUID, Quarantine> registry) {
+        if (registry.size() <= MAX_QUARANTINE_ENTRIES) {
+            return;
+        }
+
+        registry.entrySet().stream()
+                .sorted(Comparator.comparingLong(e -> e.getValue().retryAtMs()))
+                .limit(registry.size() - MAX_QUARANTINE_ENTRIES)
+                .map(Map.Entry::getKey)
+                .toList()
+                .forEach(registry::remove);
+    }
+
+    private record Quarantine(int attempts, long retryAtMs) {
     }
 
     @Getter

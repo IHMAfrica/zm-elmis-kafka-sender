@@ -24,6 +24,10 @@ elmis:
     interval-ms: 500
     idle-interval-ms: 2000
     batch-size: 100
+    # Failing records are held out of the poll query for an exponentially growing window so they
+    # cannot occupy the batch and stall everything behind them. They are never marked as synced.
+    quarantine-base-backoff-ms: 30000
+    quarantine-max-backoff-ms: 1800000
   topics:
     prescriptions: ${PRESCRIPTIONS_TOPIC}
     patient-profiles: ${PATIENT_PROFILES_TOPIC}

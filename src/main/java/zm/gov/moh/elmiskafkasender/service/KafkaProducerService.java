@@ -49,18 +49,21 @@ public class KafkaProducerService {
 
         return kafkaSender.send(Mono.just(senderRecord))
                 .next()
-                .doOnSuccess(result -> {
-                    assert result != null;
+                // A failed delivery arrives as a result carrying an exception, not as an onError
+                // signal - it must be surfaced as an error so the caller never treats it as sent.
+                .flatMap(result -> {
                     if (result.exception() != null) {
-                        log.error("Kafka send failed for [{}]: {}", correlationId, result.exception().getMessage());
-                    } else {
-                        log.debug("Message sent to {} partition {} offset {} [{}]",
-                                result.recordMetadata().topic(),
-                                result.recordMetadata().partition(),
-                                result.recordMetadata().offset(),
-                                correlationId);
+                        return Mono.error(result.exception());
                     }
+                    log.debug("Message sent to {} partition {} offset {} [{}]",
+                            result.recordMetadata().topic(),
+                            result.recordMetadata().partition(),
+                            result.recordMetadata().offset(),
+                            correlationId);
+                    return Mono.just(result);
                 })
+                .switchIfEmpty(Mono.error(
+                        new IllegalStateException("Kafka producer returned no result for " + correlationId)))
                 .doOnError(e -> log.error("Error sending message [{}]: ", correlationId, e));
     }
 

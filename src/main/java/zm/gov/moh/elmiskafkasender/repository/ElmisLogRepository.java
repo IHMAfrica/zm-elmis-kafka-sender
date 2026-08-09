@@ -11,6 +11,7 @@ import zm.gov.moh.elmiskafkasender.entity.ElmisLogRecord;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
@@ -21,7 +22,17 @@ public class ElmisLogRepository {
 
     private final DatabaseClient databaseClient;
 
-    public Flux<ElmisLogRecord> findUnprocessedRecords(int batchSize) {
+    /**
+     * Fetches the next batch of unsent rows, skipping any prescription that is currently
+     * quarantined. Without the exclusion a permanently failing prescription would be re-read on
+     * every poll and, once enough of them accumulate, would fill the whole batch and stall the
+     * pipeline.
+     */
+    public Flux<ElmisLogRecord> findUnprocessedRecords(int batchSize, Collection<UUID> excludedPrescriptionUuids) {
+        List<UUID> excluded = excludedPrescriptionUuids == null
+                ? List.of()
+                : List.copyOf(excludedPrescriptionUuids);
+
         String query = """
                 SELECT TOP (:batchSize)
                     Oid, HmisCode, PatientUuid, ArtNumber, Cd4Count, ViralLoad,
@@ -34,14 +45,32 @@ public class ElmisLogRepository {
                 FROM dbo.ElmisLogs WITH (READPAST)
                 WHERE (IsSynced IS NULL OR IsSynced = 0)
                   AND (IsDeleted IS NULL OR IsDeleted = 0)
-                ORDER BY Oid ASC
-                """;
+                """
+                + buildExclusionClause("PrescriptionUuid", excluded)
+                + " ORDER BY Oid ASC";
 
-        return databaseClient.sql(query)
-                .bind("batchSize", batchSize)
-                .map((row, metadata) -> mapToElmisLogRecord(row))
+        DatabaseClient.GenericExecuteSpec spec = databaseClient.sql(query).bind("batchSize", batchSize);
+        for (int i = 0; i < excluded.size(); i++) {
+            spec = spec.bind("ex" + i, excluded.get(i));
+        }
+
+        return spec.map((row, metadata) -> mapToElmisLogRecord(row))
                 .all()
                 .doOnError(e -> log.error("Failed to fetch unprocessed ELMIS records", e));
+    }
+
+    private String buildExclusionClause(String column, List<UUID> excluded) {
+        if (excluded.isEmpty()) {
+            return "";
+        }
+        StringBuilder clause = new StringBuilder(" AND ").append(column).append(" NOT IN (");
+        for (int i = 0; i < excluded.size(); i++) {
+            if (i > 0) {
+                clause.append(", ");
+            }
+            clause.append(":ex").append(i);
+        }
+        return clause.append(")").toString();
     }
 
     public Flux<Integer> findPREPAndPEPRegimenIds() {
